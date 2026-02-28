@@ -1,0 +1,66 @@
+package protocol
+
+import "time"
+
+// AcquireReq 表示租约申请请求。
+type AcquireReq struct {
+	Project string `json:"project"`
+	PID     int    `json:"pid"`
+	RunID   string `json:"run_id,omitempty"`
+}
+
+// ResourceEndpoint 表示单个容器实例的连接信息。
+type ResourceEndpoint struct {
+	Name     string            `json:"name"`
+	Type     string            `json:"type"`
+	Image    string            `json:"image"`
+	Host     string            `json:"host"`
+	Ports    map[string]int    `json:"ports"`
+	URI      string            `json:"uri"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// AcquireResp 表示租约申请响应。
+type AcquireResp struct {
+	LeaseID    string                      `json:"lease_id"`
+	AcquiredAt time.Time                   `json:"acquired_at"`
+	Resources  map[string]ResourceEndpoint `json:"resources"`
+}
+
+// HeartbeatReq 表示租约心跳请求。
+type HeartbeatReq struct {
+	LeaseID string `json:"lease_id"`
+}
+
+// ReleaseReq 表示租约释放请求。
+type ReleaseReq struct {
+	LeaseID  string `json:"lease_id"`
+	ExitCode int    `json:"exit_code"`
+}
+
+// OKResp 表示通用成功响应。
+type OKResp struct {
+	OK bool `json:"ok"`
+}
+
+// StateResp 表示守护进程状态响应。
+type StateResp struct {
+	InfraReady    bool      `json:"infra_ready"`
+	ActiveLeases  int       `json:"active_leases"`
+	Containers    []string  `json:"containers"`
+	StartedAt     time.Time `json:"started_at"`
+	IdleTTLSecond int       `json:"idle_ttl_second"`
+	AppReady      bool      `json:"app_ready"`
+	AppPID        int       `json:"app_pid"`
+	AppStartedAt  time.Time `json:"app_started_at"`
+	AppRestarts   int       `json:"app_restarts"`
+	AppLastError  string    `json:"app_last_error,omitempty"`
+}
+
+// RuntimeInfo 表示 daemon 发现文件内容。
+type RuntimeInfo struct {
+	Addr      string    `json:"addr"`
+	Token     string    `json:"token"`
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+}
