@@ -1,53 +1,80 @@
-# {Interface Name}
+**本节提供生成文档的要求和规则，本节中的内容不应该出现在 artifact 当中**
 
-## Interface Definition
-<!-- Required -->
+本文档针对 spec 文件所表述的行为生成初版接口设计
+**核心目的**
+1. **审核接口设计是否合理**
+2. **后面流程中生成测试用例时使用**
 
-- **Capability:**
-  <!-- Capability this interface belongs to -->
+**只有 public API 才是文档的一等公民，接口定义，数据结构定义不应该单独成节**
+如果有契约定义，数据模型定义应该放在接口的备注一节中详细描述
 
-- **Interface Type:**
-  <!-- Interface category: HTTP | CLI | Module | SDK | Other -->
+在生成接口描述之前，先要仔细理解代码，明确改动设计的范围
+如果是 增加接口，那么需要在名称前面加一个 **[ADD]**
+如果是 修改接口，那么需要在名称前面加一个 **[MODIFY]**
+如果是 删除接口，那么需要在名称前面加一个 **[REMOVE]**,并且不需要再写接口的详细描述
 
-- **Interface Name:**
-  <!-- Public interface name -->
+！！！后面的内容才应该出现在 artifact 文档中
+-----
 
-- **Summary:**
-  <!-- Brief description of purpose and behavior -->
+**若是程序模块公共接口使用如下格式**
 
-## Route Definition
-<!-- Include this section ONLY when Interface Type = HTTP -->
+# <!-- 函数名 -->
 
-- **Method:**
-  <!-- HTTP method: GET | POST | PUT | PATCH | DELETE -->
+## 描述
+  <!-- 简短描述API的作用 -->
 
-- **Route:**
-  <!-- HTTP route path -->
+## 签名
+  <!-- 根据所用编程语言，生成完整的函数签名 -->
 
-## Parameters
-<!-- List only externally visible input parameters -->
+## 参数说明
+  <!-- 根据以下维度解释参数 -->
+| Name | Type | Required | Description |
+| ---- | ---- | -------- | ----------- |
 
-| Name   | Type     | Required | Description   |
-| ------ | -------- | -------- | ------------- |
-| {name} | `{type}` | Yes/No   | {description} |
+## 返回值说明
+  <!-- 根据以下维度解释返回值 -->
+| Name | Type | Required | Description |
+| ---- | ---- | -------- | ----------- |
 
-## Response
-<!-- Describe the successful result struct, empty table if the response body is empty or trivial -->
+## 错误说明
 
-| Name   | Type     | Required | Description   |
-| ------ | -------- | -------- | ------------- |
-| {name} | `{type}` | Yes/No   | {description} |
+### {错误情况简短描述 #1}
+- **错误码：** <!-- 如果有的话才出现 -->
+- **错误消息：** <!-- 如果有的话才出现 -->
 
-## Error
-<!-- Describe meaningful caller-visible failure cases -->
+## 备注
+<!-- 如果有的话，说明需要调用者注意的特殊处理，兼容性约束，或者权衡 -->
 
-### {Short Error Situation Description #1}
+----
+
+**若是 HTTP API 使用如下格式**
+
+# <!-- URI：Method-->
+
+## 描述
+  <!-- 简短描述API的作用 -->
+
+## 参数
+<!-- 根据以下维度解释参数 -->
+
+| Name   | Type   | Required | Description  |
+| ------ | ------ | -------- | ------------ |
+| region | string | Yes      | 用户注册地区 |
+
+## 响应
+<!-- 根据以下维度解释返回值 -->
+| Name        | Type | Required | Description      |
+| ----------- | ---- | -------- | ---------------- |
+| mfa_enabled | bool | Yes      | 用户是否设置 MFA |
+
+## 错误说明
+
+### {错误情况简短描述 #1}
 - **HTTP Status:** <!-- HTTP Status Code -->
 - **Error Code:** <!-- Business Error Code -->
-- **Condition:** <!-- when this error happens -->
 - **Description:** <!-- what this error means to the caller -->
-- **Error Response:** <!-- Specific Error Response for This Situation  -->
 - **Notes:** <!-- special handling or tradeoff if any -->
 
-## Notes
-<!-- Describe special handling, compatibility constraints, or tradeoffs -->
+## 备注
+<!-- 如果有的话，说明需要调用者注意的特殊处理，兼容性约束，或者权衡 -->
+

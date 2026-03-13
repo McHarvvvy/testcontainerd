@@ -6,7 +6,7 @@ tools:
   grep: true
   glob: true
   bash: true
-model: "GPT-5.3 Codex"
+model: openai/gpt-5.3-codex
 ---
 
 You are a senior Go code reviewer ensuring high standards of idiomatic Go and best practices.
