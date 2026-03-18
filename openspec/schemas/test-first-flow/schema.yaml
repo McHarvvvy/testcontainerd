@@ -124,42 +124,7 @@ artifacts:
       Specs should be testable - each scenario is a potential test case.
     requires:
       - proposal
-
-  - id: infc-design
-    generates: infc-design.md
-    description: Interaction and interface design document  
-    template: infc-design.md
-    instruction: >
-      Produce an artifact that defines the **API-level changes** required by `spec.md`.
-
-      Requirements:
-      - The artifact **MUST** be organized **by capability**, same as `spec.md`.
-      - The artifact **MUST** be placed in the **same directory** as `spec.md`.
-      - If the task does **NOT** involve any API **addition**, **modification**, or **removal**, the artifact content **MUST be empty**.
-
-      Scope:
-      - API design is **NOT limited to HTTP interfaces**.
-      - Include relevant **REST APIs**, **CLI interfaces**, and **public code/module interfaces** when applicable.
-
-      Design goals:
-      - **reasonable**
-      - **easy to use**
-      - **aligned with requirements**
-      - **easy to extend**
-      - **developer-friendly**
-
-      Required skills:
-      - Use **`api-design-principles`** for **RESTful API** design.
-      - Use **`cli-developer`** for **CLI** design.
-      - After design is complete, use **`dx-optimizer`** to evaluate developer experience.
-
-      Post-review:
-      - If **`dx-optimizer`** suggests improvements, the agent **MUST** evaluate them carefully and apply appropriate revisions.
-
-      Only finish this step after the interface definition has been reviewed and improved where necessary.
-    requires:
-      - specs
-
+    
   - id: design
     generates: design.md
     description: Technical design document with implementation details
@@ -200,6 +165,7 @@ artifacts:
 
       Good design docs explain the "why" behind technical decisions.
     requires:
+      - specs
       - proposal
 
   - id: tasks
@@ -209,12 +175,10 @@ artifacts:
     instruction: >
       Create the task list that breaks down the implementation work.
 
-
       **IMPORTANT: Follow the template below exactly.** The apply phase parses
 
       checkbox format to track progress. Tasks not using `- [ ]` won't be
       tracked.
-
 
       Guidelines:
 
@@ -226,28 +190,22 @@ artifacts:
 
       - Order tasks by dependency (what must be done first?)
 
-
       Example:
 
       ```
-
       ## 1. Setup
-
 
       - [ ] 1.1 Create new module structure
 
       - [ ] 1.2 Add dependencies to package.json
 
-
       ## 2. Core Implementation
-
 
       - [ ] 2.1 Implement data export function
 
       - [ ] 2.2 Add CSV formatting utilities
 
       ```
-
 
       Reference specs for what needs to be built, design for how to build it.
 
