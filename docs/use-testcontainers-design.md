@@ -48,6 +48,18 @@ SUT 启动阶段，`StartSUTInput.Resources` 将上述连接信息传入 `SUTBoo
 
 ## Interface Design
 
+### 0. API 行为契约（`New` / `Run`）
+
+为避免调用方感知内部实现细节，框架对外仅承诺以下可观察行为：
+
+- `New(cfg, registerContainers)` 对配置做规范化：`Global.Project` 为空时默认填充为 `"default"`，`Global.RuntimePath` 为空时默认填充为系统默认 runtime 路径。
+- 除 `Project` / `RuntimePath` 外，其他关键配置（如 daemon 监听地址、client 请求地址等）必须显式合法；不合法时 `New` 立即返回错误。
+- `registerContainers` 不允许为 `nil`；返回空切片也视为非法输入，`New` 立即返回错误（容器注册列表不能为空）。
+- 注册名冲突、`Name`/`Start` 为空等注册阶段错误在初始化阶段 fail-fast（`New` / `Bundle` 构建阶段），不进入运行态。
+- `Run(m)` 仅在依赖容器与 SUT 均完成启动并就绪后才调用 `m.Run()`；任一前置阶段失败都不会执行 `m.Run()`，并返回 `1`。
+- 若 `m.Run()` 被执行，`Run(m)` 原样透传其退出码（`0 -> 0`，`1 -> 1`）。
+- 调用方无需区分 client/daemon 模式；模式选择与资源复用由框架在 `Run` 期间自动处理。
+
 ### 1. `ContainerRegistration`（`container` 包，替换 `InstanceConfig`）
 
 ```go
@@ -71,21 +83,23 @@ type ContainerRegistration struct {
 
 **行为约束：**
 
-- `Name` 和 `Start` 均不得为空，否则注册时立即返回错误。
+- `Name` 和 `Start` 均不得为空，否则 `Bundle` 构建时立即返回错误。
 - `Init` 为 `nil` 时跳过，不报错。
-- 同一 `Name` 不得重复注册（Registry 维持现有去重逻辑）。
+- 同一 `Name` 不得重复，`Bundle` 构建时检测，重复即报错。
 - 各注册项返回的 `SUTEnv` key 不得跨注册项重复；聚合阶段检测到冲突时 fail-fast，报告冲突双方的注册名，并触发全量回滚。
 
-### 2. `Registrar` 接口（`testcontainerd` 包顶层）
+### 2. `RegisterContainersFunc`（`testcontainerd` 包顶层）
 
 ```go
-// Registrar 定义容器注册行为（破坏式替换）。
-type Registrar interface {
-    Register(r container.ContainerRegistration) error
-}
+// RegisterContainersFunc 是调用方在 daemon 模式下一次性声明所有容器注册项的函数。
+// 框架在 daemon 启动前调用该函数，用返回的切片直接初始化 Bundle；
+// 无需 Registrar 接口，无需 Registry 中间存储。
+type RegisterContainersFunc func(ctx context.Context) ([]container.ContainerRegistration, error)
 ```
 
-`Registrar` 的职责严格限定为**容器注册**，不承载任何 SUT 进程相关的配置。
+调用方在函数体内构造并返回完整的注册项切片，切片顺序即为容器的注册/启动顺序。
+`RegisterContainersFunc` 的职责严格限定为**声明容器注册项**，不承载任何 SUT 进程相关的配置。
+返回空切片属于非法输入，框架在初始化阶段直接报错（容器注册列表不能为空）。
 
 ### 3. `StartSUTInput` 与 `GetCommand` 语义（`daemon` 包）
 
@@ -183,21 +197,23 @@ client 侧收到 LeaseID，测试代码从 os.Getenv() 读取 SUT 地址等信�
 （SUT 进程 env = 调用方静态配置 + 容器连接信息，由框架统一注入）
 ```
 
+注：以上是框架内部执行路径。对调用方而言，仅需调用 `Run(m)` 并基于其返回值与环境可用性进行断言，不需要感知 client/daemon 的分支细节。
+
 ### 关键模块变更概览
 
-| 模块                                | 变更类型    | 核心变化                                                                                               |
-| ----------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------ |
-| `container/options.go`              | 删除 + 重建 | 删除 `InstanceConfig`、`WithType` 等，新增 `ContainerRegistration`、`StartedContainer`                 |
-| `container/registry.go`             | 重构        | 存储类型由 `InstanceConfig` → `ContainerRegistration`；去掉端口冲突预检                                |
-| `container/bundle.go`               | 重构        | `StartAll` 返回 `map[string]string`；新增 SUTEnv 聚合与冲突检测；删除 `resourcesLocked`、`Endpoints()` |
-| `container/drivers.go`              | 删除        | 框架不再构建 `ContainerRequest`                                                                        |
-| `container/spec/`                   | 删除        | 彻底移除 spec.Driver 体系                                                                              |
-| `protocol/types.go`                 | 修改        | 删除 `ResourceEndpoint`、`AcquireResp.Resources`                                                       |
-| `daemon/sut_manager.go`             | 修改        | `StartSUTInput` 去掉 `Resources`，加入 `SUTEnv`；`ensureStarted` 新增 env 合并与冲突检测               |
-| `daemon/server.go` / `lifecycle.go` | 修改        | `ensureInfraStarted` 返回 `SUTEnv`；`handleAcquire` 响应精简                                           |
-| `client/client.go`                  | 修改        | `Acquire` 返回 `LeaseInfo`（无 Resources）                                                             |
-| `testcontainerd.go`                 | 修改        | `Registrar` 接口精简；删除 `SUT.SetEnvEndpoint()` 调用                                                 |
-| `constant/container.go`             | 清理        | 删除仅服务于 spec 的类型常量                                                                           |
+| 模块                                | 变更类型    | 核心变化                                                                                                                              |
+| ----------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `container/options.go`              | 删除 + 重建 | 删除 `InstanceConfig`、`WithType` 等，新增 `ContainerRegistration`、`StartedContainer`                                                |
+| `container/registry.go`             | 删除        | `Registry` 全局状态不再需要；校验逻辑上移至 `Bundle` 构建时                                                                           |
+| `container/bundle.go`               | 重构        | `NewBundle` 接收 `[]ContainerRegistration`；`StartAll` 返回 `map[string]string`；新增 SUTEnv 聚合与冲突检测；删除 `Endpoints()`       |
+| `container/drivers.go`              | 删除        | 框架不再构建 `ContainerRequest`                                                                                                       |
+| `container/spec/`                   | 删除        | 彻底移除 spec.Driver 体系                                                                                                             |
+| `protocol/types.go`                 | 修改        | 删除 `ResourceEndpoint`、`AcquireResp.Resources`                                                                                      |
+| `daemon/sut_manager.go`             | 修改        | `StartSUTInput` 去掉 `Resources`，加入 `SUTEnv`；`ensureStarted` 新增 env 合并与冲突检测                                              |
+| `daemon/server.go` / `lifecycle.go` | 修改        | `New` 接收 `[]ContainerRegistration`（替代 `*Registry`）；`ensureInfraStarted` 返回 `SUTEnv`；`handleAcquire` 响应精简                |
+| `client/client.go`                  | 修改        | `Acquire` 返回 `LeaseInfo`（无 Resources）                                                                                            |
+| `testcontainerd.go`                 | 修改        | 删除 `Registrar` 接口、`RegisterContainersHook`、`registryRegistrar`；新增 `RegisterContainersFunc`；删除 `SUT.SetEnvEndpoint()` 调用 |
+| `constant/container.go`             | 清理        | 删除仅服务于 spec 的类型常量                                                                                                          |
 
 ---
 
@@ -253,6 +269,21 @@ client 侧收到 LeaseID，测试代码从 os.Getenv() 读取 SUT 地址等信�
 **决策**：框架在 `daemon/cleanup.go` 中保留按注册名清理孤儿容器的逻辑，但不强制校验调用方是否设置了固定名称。文档层面要求：在 `Start` 函数内通过 `ContainerRequest.Name` 设置与注册项 `Name` 一致的容器名。
 
 **原因**：强校验（读取容器名再比对）需要在 `Start` 返回后额外调用 Docker API，增加启动耗时和 Docker 依赖复杂度。改为文档约束是实用主义选择：大多数场景调用方会遵循，少数不遵循的场景孤儿清理不生效也可接受（容器会在测试结束时由 `Terminate` 正常清理）。
+
+---
+
+### KTD-6：以"调用方一次性返回注册项切片"替代"Registrar 接口 + Registry 全局状态"
+
+**决策**：删除 `Registrar` 接口、`RegisterContainersHook`、`registryRegistrar` 适配器和 `container.Registry`，改为单一函数类型 `RegisterContainersFunc func(ctx context.Context) ([]container.ContainerRegistration, error)`。调用方在函数体内构造完整切片，框架在 daemon 启动前调用一次，结果直接用于初始化 `Bundle`。
+
+**原因**：
+
+1. **语义对齐**：调用方的实际意图是"声明我需要这些容器"，返回切片的函数直接表达这一意图；而 `Register(single)` 是命令式逐个调用，迫使调用方写多次调用和逐一错误处理，语义错位。
+2. **消除全局可变状态**：`Registry` 是 hook 调用与 daemon 启动之间的中间状态容器，需要依赖 `Freeze()` 的调用时序来保证一致性——这是一种隐式的全局变量模式。改为函数返回值后，配置的生命周期完全由函数调用控制，不存在竞态或时序依赖。
+3. **校验提前**：`Name`/`Start` 非空校验和名称唯一性校验可在 `NewBundle` 构建时统一完成，错误在 daemon 初始化阶段即暴露，而不是等到 `StartAll` 运行时。
+4. **语义收敛**：将“hook 存在性、注册列表非空、注册项合法性”统一前移到初始化阶段，可避免 `Run` 期间才发现配置级错误，调用方故障定位更直接。
+
+**代码影响**：`container/registry.go` 全量删除；`container.NewBundle` 签名改为 `NewBundle(regs []ContainerRegistration) (*Bundle, error)`；`daemon.New` 签名改为 `New(cfg Config, regs []ContainerRegistration) (*Daemon, error)`；`testcontainerd.go` 删除 `Registrar`、`RegisterContainersHook`、`registryRegistrar`，新增 `RegisterContainersFunc`。
 
 ---
 
