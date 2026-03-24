@@ -34,6 +34,12 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// LeaseInfo 是 Acquire 的返回值，仅包含租约信息。
+type LeaseInfo struct {
+	LeaseID    string
+	AcquiredAt time.Time
+}
+
 // New 创建客户端并连接 daemon。
 func New(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Project == "" {
@@ -54,14 +60,16 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 }
 
 // Acquire 向 daemon 申请租约。
-func (c *Client) Acquire(ctx context.Context) (protocol.AcquireResp, error) {
+func (c *Client) Acquire(ctx context.Context) (LeaseInfo, error) {
 	req := protocol.AcquireReq{
 		Project: c.cfg.Project,
 		PID:     os.Getpid(),
 	}
 	var resp protocol.AcquireResp
-	err := c.post(ctx, protocol.PathAcquire, req, &resp)
-	return resp, err
+	if err := c.post(ctx, protocol.PathAcquire, req, &resp); err != nil {
+		return LeaseInfo{}, err
+	}
+	return LeaseInfo{LeaseID: resp.LeaseID, AcquiredAt: resp.AcquiredAt}, nil
 }
 
 // Heartbeat 发送租约心跳。

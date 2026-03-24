@@ -3,24 +3,22 @@ package daemon
 import (
 	"context"
 	"log"
-
-	"github.com/McHarvvvy/testcontainerd/protocol"
 )
 
-func (d *Daemon) ensureInfraStarted(ctx context.Context) (map[string]protocol.ResourceEndpoint, error) {
+func (d *Daemon) ensureInfraStarted(ctx context.Context) (map[string]string, error) {
 	// 关键决策：基础设施启动入口串行化，避免同一 daemon 被并发 Acquire 重复拉容器。
 	d.startMu.Lock()
 	defer d.startMu.Unlock()
 	if d.infraStarted {
-		return d.bundle.Endpoints(), nil
+		return map[string]string{}, nil
 	}
-	ep, err := d.bundle.StartAll(ctx)
+	_, err := d.bundle.StartAll(ctx)
 	if err != nil {
 		log.Printf("testcontainerd ensureInfraStarted failed: %v", err)
 		return nil, err
 	}
 	d.infraStarted = true
-	return ep, nil
+	return map[string]string{}, nil
 }
 
 func (d *Daemon) stopContainersOnly(ctx context.Context) error {
@@ -37,11 +35,11 @@ func (d *Daemon) stopContainersOnly(ctx context.Context) error {
 	return nil
 }
 
-func (d *Daemon) ensureSUTStarted(ctx context.Context, resources map[string]protocol.ResourceEndpoint) error {
+func (d *Daemon) ensureSUTStarted(ctx context.Context, env map[string]string) error {
 	return d.sut.ensureStarted(ctx, StartSUTInput{
 		Project:     d.cfg.Project,
 		RuntimePath: d.cfg.RuntimePath,
-		Resources:   resources,
+		SUTEnv:      env,
 	})
 }
 

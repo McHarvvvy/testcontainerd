@@ -10,6 +10,7 @@ type AcquireReq struct {
 }
 
 // ResourceEndpoint 表示单个容器实例的连接信息。
+// 兼容旧实现保留该类型，但 AcquireResp 不再返回此字段。
 type ResourceEndpoint struct {
 	Name     string            `json:"name"`
 	Type     string            `json:"type"`
@@ -22,9 +23,8 @@ type ResourceEndpoint struct {
 
 // AcquireResp 表示租约申请响应。
 type AcquireResp struct {
-	LeaseID    string                      `json:"lease_id"`
-	AcquiredAt time.Time                   `json:"acquired_at"`
-	Resources  map[string]ResourceEndpoint `json:"resources"`
+	LeaseID    string    `json:"lease_id"`
+	AcquiredAt time.Time `json:"acquired_at"`
 }
 
 // HeartbeatReq 表示租约心跳请求。

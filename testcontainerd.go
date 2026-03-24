@@ -2,12 +2,12 @@ package testcontainerd
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
-	"testing"
 	"time"
 
 	"github.com/McHarvvvy/testcontainerd/client"
@@ -17,13 +17,13 @@ import (
 	"github.com/McHarvvvy/testcontainerd/tcdruntime"
 )
 
-// Registrar 定义容器注册行为。
-type Registrar interface {
-	Register(cfg container.InstanceConfig) error
+// Runnable 表示可执行的测试入口。*testing.M 天然满足此接口。
+type Runnable interface {
+	Run() int
 }
 
-// RegisterContainersHook 定义容器注册钩子。
-type RegisterContainersHook func(ctx context.Context, r Registrar) error
+// RegisterContainersFunc 定义容器注册函数。
+type RegisterContainersFunc func(ctx context.Context) ([]container.ContainerRegistration, error)
 
 // StartSUTInput 定义被测服务启动输入。
 type StartSUTInput = daemon.StartSUTInput
@@ -69,33 +69,53 @@ type ClientConfig struct {
 
 // TestContainerd 是 testcontainerd 的统一运行入口。
 type TestContainerd struct {
-	cfg          Config
-	registerHook RegisterContainersHook
-	registry     *container.Registry
-}
-
-type registryRegistrar struct {
-	reg *container.Registry
-}
-
-func (r *registryRegistrar) Register(cfg container.InstanceConfig) error {
-	return r.reg.Register(cfg)
+	cfg                Config
+	registerContainers RegisterContainersFunc
+	registrations      []container.ContainerRegistration
 }
 
 // New 创建 TestContainerd 实例。
-func New(cfg Config, registerHook RegisterContainersHook) (*TestContainerd, error) {
+func New(cfg Config, registerContainers RegisterContainersFunc) (*TestContainerd, error) {
 	normalizeGlobal(&cfg.Global)
+	if strings.TrimSpace(cfg.Daemon.Addr) == "" {
+		return nil, fmt.Errorf("daemon addr is required")
+	}
 	if cfg.Client.HTTPTimeout <= 0 {
-		cfg.Client.HTTPTimeout = 1 * time.Minute
+		return nil, fmt.Errorf("client http timeout must be > 0")
 	}
 	if cfg.Daemon.IdleTTL <= 0 {
-		cfg.Daemon.IdleTTL = 60 * time.Second
+		return nil, fmt.Errorf("daemon idle ttl must be > 0")
+	}
+	if registerContainers == nil {
+		return nil, fmt.Errorf("registerContainers cannot be nil")
+	}
+
+	regs, err := registerContainers(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if len(regs) == 0 {
+		return nil, fmt.Errorf("container registrations cannot be empty")
+	}
+	seen := make(map[string]struct{}, len(regs))
+	for i := range regs {
+		name := strings.TrimSpace(regs[i].Name)
+		if name == "" {
+			return nil, fmt.Errorf("container registration name cannot be empty")
+		}
+		if regs[i].Start == nil {
+			return nil, fmt.Errorf("container registration start cannot be nil: %s", name)
+		}
+		if _, ok := seen[name]; ok {
+			return nil, fmt.Errorf("duplicated container name: %s", name)
+		}
+		seen[name] = struct{}{}
 	}
 
 	return &TestContainerd{
-		cfg:          cfg,
-		registerHook: registerHook,
-		registry:     container.NewRegistry(),
+		cfg:                cfg,
+		registerContainers: registerContainers,
+		registrations:      regs,
 	}, nil
 }
 
@@ -112,8 +132,13 @@ func normalizeGlobal(cfg *GlobalConfig) {
 	cfg.RuntimePath = runtimePath
 }
 
+// RuntimePath 返回框架内部使用的 runtime 文件路径。
+func (t *TestContainerd) RuntimePath() string {
+	return t.cfg.Global.RuntimePath
+}
+
 // Run 是 TestMain 的统一执行入口。
-func (t *TestContainerd) Run(m *testing.M) int {
+func (t *TestContainerd) Run(m Runnable) int {
 	if os.Getenv(tdconstant.EnvTCDMode) == tdconstant.TCDModeDaemon {
 		return t.runDaemonMode()
 	}
@@ -123,10 +148,15 @@ func (t *TestContainerd) Run(m *testing.M) int {
 func (t *TestContainerd) runDaemonMode() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	if t.registerHook != nil {
-		if err := t.registerHook(ctx, &registryRegistrar{reg: t.registry}); err != nil {
-			log.Printf("testcontainerd register hook failed: %v", err)
+	if t.registerContainers == nil {
+		log.Printf("testcontainerd registerContainers is nil")
+		return 1
+	}
+	if len(t.registrations) == 0 {
+		var loadErr error
+		t.registrations, loadErr = t.registerContainers(ctx)
+		if loadErr != nil {
+			log.Printf("testcontainerd register containers failed: %v", loadErr)
 			return 1
 		}
 	}
@@ -143,7 +173,14 @@ func (t *TestContainerd) runDaemonMode() int {
 		dcfg.RuntimePath = v
 	}
 
-	d := daemon.New(dcfg, t.registry)
+	registry := container.NewRegistry()
+	for _, reg := range t.registrations {
+		if err := registry.Register(container.InstanceConfig{Name: reg.Name, Type: container.TypeRedis, Image: "redis:7.2-alpine"}); err != nil {
+			log.Printf("testcontainerd register compatibility bridge failed: %v", err)
+			return 1
+		}
+	}
+	d := daemon.New(dcfg, registry)
 	if err := d.Start(ctx); err != nil {
 		log.Printf("testcontainerd daemon mode exited with error: %v", err)
 		return 1
@@ -151,7 +188,7 @@ func (t *TestContainerd) runDaemonMode() int {
 	return 0
 }
 
-func (t *TestContainerd) runClientMode(m *testing.M) int {
+func (t *TestContainerd) runClientMode(m Runnable) int {
 	if m == nil {
 		return 1
 	}
@@ -172,15 +209,6 @@ func (t *TestContainerd) runClientMode(m *testing.M) int {
 		return 1
 	}
 	stopHB := c.StartHeartbeat(lease.LeaseID)
-	if t.cfg.SUT != nil && t.cfg.SUT.IsEnable() {
-		// 关键决策：endpoint 环境变量由业务方计划对象统一注入，
-		// 避免 testcontainerd 框架层写死具体环境变量名称。
-		if err = t.cfg.SUT.SetEnvEndpoint(); err != nil {
-			log.Printf("testcontainerd set sut endpoint env failed: %v", err)
-			_ = c.Release(ctx, lease.LeaseID, 1)
-			return 1
-		}
-	}
 
 	code := m.Run()
 	// 关键决策：先停止心跳再释放租约，避免 release 阻塞期间继续续租导致 SUT 迟迟不回收。

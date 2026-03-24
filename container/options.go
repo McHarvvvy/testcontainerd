@@ -6,7 +6,22 @@ import (
 
 	tdconstant "github.com/McHarvvvy/testcontainerd/constant"
 	"github.com/McHarvvvy/testcontainerd/container/spec"
+	"github.com/testcontainers/testcontainers-go"
 )
+
+// StartedContainer 是调用方 Start 函数的返回值。
+// Container 由框架托管生命周期；SUTEnv 用于向 SUT 注入连接类环境变量。
+type StartedContainer struct {
+	Container testcontainers.Container
+	SUTEnv    map[string]string
+}
+
+// ContainerRegistration 表示单个容器注册项。
+type ContainerRegistration struct {
+	Name  string
+	Start func(ctx context.Context) (StartedContainer, error)
+	Init  func(ctx context.Context) error
+}
 
 // ContainerType 表示容器类型。
 type ContainerType string

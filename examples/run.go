@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/McHarvvvy/testcontainerd"
+	"github.com/McHarvvvy/testcontainerd/container"
 )
 
 // Run 是各测试包 TestMain 的统一入口。
@@ -27,8 +28,8 @@ func Run(m *testing.M) int {
 			},
 			SUT: newSUTBootPlan(),
 		},
-		func(ctx context.Context, r testcontainerd.Registrar) error {
-			return RegisterContainers(r)
+		func(ctx context.Context) ([]container.ContainerRegistration, error) {
+			return RegisterContainers(ctx)
 		},
 	)
 	if err != nil {

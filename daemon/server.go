@@ -171,14 +171,14 @@ func (d *Daemon) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	// 关键决策：Acquire 串联“容器基础设施就绪 + 被测服务进程就绪”，
 	// 只有两者都完成才返回租约，确保用例拿到的是可用环境而非半初始化状态。
 	infraStart := time.Now()
-	ep, err := d.ensureInfraStarted(r.Context())
+	env, err := d.ensureInfraStarted(r.Context())
 	if err != nil {
 		log.Printf("testcontainerd acquire ensure infra failed cost=%s err=%v", time.Since(infraStart), err)
 		writeError(w, http.StatusInternalServerError, protocol.ErrCodeInternal, err.Error())
 		return
 	}
 	appStart := time.Now()
-	if err = d.ensureSUTStarted(r.Context(), ep); err != nil {
+	if err = d.ensureSUTStarted(r.Context(), env); err != nil {
 		log.Printf("testcontainerd acquire ensure sut failed cost=%s err=%v", time.Since(appStart), err)
 		writeError(w, http.StatusInternalServerError, protocol.ErrCodeInternal, err.Error())
 		return
@@ -187,7 +187,6 @@ func (d *Daemon) handleAcquire(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, protocol.AcquireResp{
 		LeaseID:    l.ID,
 		AcquiredAt: time.Now(),
-		Resources:  ep,
 	})
 }
 

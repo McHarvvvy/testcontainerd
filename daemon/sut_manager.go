@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/McHarvvvy/testcontainerd/protocol"
 	"github.com/McHarvvvy/testcontainerd/tcdruntime"
 )
 
@@ -23,8 +22,8 @@ type StartSUTInput struct {
 	Project string
 	// RuntimePath 表示当前 daemon runtime 文件路径。
 	RuntimePath string
-	// Resources 提供已启动容器资源端点，供 SUT 启动时注入依赖配置。
-	Resources map[string]protocol.ResourceEndpoint
+	// SUTEnv 提供由容器侧聚合得到的环境变量集合。
+	SUTEnv map[string]string
 }
 
 // SUTBootPlan 定义被测服务启动与探测计划。
@@ -42,8 +41,6 @@ type SUTBootPlan interface {
 	// GetProbeAddrs 返回就绪探测地址列表（ip:port）。
 	// 返回空列表表示不需要端口探测，仅检查进程短时间内未立即退出。
 	GetProbeAddrs() []string
-	// SetEnvEndpoint 在 client mode 中设置测试代码所需 endpoint 环境变量。
-	SetEnvEndpoint() error
 }
 
 type sutState struct {
