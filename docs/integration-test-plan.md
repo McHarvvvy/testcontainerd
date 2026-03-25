@@ -141,6 +141,8 @@ When  连续执行两次完全独立的 testcontainerd 实例的 Run(fakeM)
 Then  两次 Run 调用都成功返回 0
 And   两次 fakeM.Run() 内部通过 Docker API inspect 获取的容器 ID 相同，
       证明复用了同一个底层 Redis 容器
+And   两次 fakeM.Run() 内通过 tcdruntime.Read() 获取的 daemon PID 相同，
+      证明复用了同一个 daemon 进程
 ```
 
 ---
@@ -161,7 +163,7 @@ And   RegisterContainersFunc 返回两个 ContainerRegistration：
 When  调用 Run(fakeM)
 Then  Run 返回 1
 And   fakeM.Run() 不会被调用
-And   通过 Docker API 验证容器 "redis-good" 已不存在（框架显式回滚的结果）
+And   Run 返回后单次验证容器 "redis-good" 已不存在（框架在 Run 返回前已完成回滚）
 ```
 
 ### TC-11 Init 函数失败触发全量回滚
@@ -178,60 +180,29 @@ And   RegisterContainersFunc 返回两个 ContainerRegistration：
 When  调用 Run(fakeM)
 Then  Run 返回 1
 And   fakeM.Run() 不会被调用
-And   通过 Docker API 验证两个容器均已不存在（框架显式全量回滚的结果）
+And   Run 返回后单次验证两个容器均已不存在（框架在 Run 返回前已完成回滚）
 ```
 
 ---
 
-## Feature: SUTEnv 机制（Run）
+## Feature: SUT 环境变量注入（Run）
 
-### TC-12 多容器 SUTEnv key 跨注册项冲突
+### TC-14 调用方在 GetCommand 中注入 SUT 环境变量
 
-**说明**：各注册项 `Start()` 返回的 `StartedContainer.SUTEnv` 由框架在 daemon 内聚合。如果不同注册项的 SUTEnv 包含相同的 key，框架应 fail-fast 并全量回滚。
-
-```gherkin
-Given 构造合法 Config
-And   RegisterContainersFunc 返回两个 ContainerRegistration：
-        注册项 A：Start 正常启动真实容器，返回 SUTEnv = {"DB_ADDR": "containerA:3306"}
-        注册项 B：Start 正常启动真实容器，返回 SUTEnv = {"DB_ADDR": "containerB:3306"}（key 冲突）
-# defer/t.Cleanup 注册兜底清理：强制停止 daemon（如存活）、销毁以上两个容器（如存在）、删除 runtime.json（如存在）
-When  调用 Run(fakeM)
-Then  Run 返回 1
-And   fakeM.Run() 不被调用
-And   错误信息包含冲突的 key "DB_ADDR" 和涉及的两个注册项名称
-And   通过 Docker API 验证两个容器均已不存在（框架显式全量回滚的结果）
-```
-
-### TC-13 cmd.Env 与容器 SUTEnv key 冲突
-
-**说明**：框架在启动 SUT 时会合并 `GetCommand` 返回的 `cmd.Env`（SUT 静态配置）与容器聚合的 `SUTEnv`（连接信息）。如果两者存在相同的 key，框架应拒绝启动并报错。这与 TC-12（容器间冲突）是不同的合并点和代码路径。
+**说明**：新设计中框架不再做 SUTEnv 聚合/合并/冲突检测。所有 SUT 环境变量由调用方在 `GetCommand()` 的 `cmd.Env` 中统一定义。调用方在 `GetCommand` 内通过 Docker API 按容器名查询连接地址，自行构造环境变量注入 SUT 子进程。本用例验证调用方全权负责的 SUT 环境变量注入路径是否可用。
 
 ```gherkin
 Given 构造合法 Config，启用 SUT 托管
-And   RegisterContainersFunc 注册一个真实容器，Start 返回 SUTEnv = {"APP_PORT": "3306"}
-And   SUTBootPlan.GetCommand 在 cmd.Env 中声明了 "APP_PORT=8080"（与容器 SUTEnv key 冲突）
-# defer/t.Cleanup 注册兜底清理：强制停止 daemon 和 SUT 进程（如存活）、销毁容器（如存在）、删除 runtime.json（如存在）
-When  调用 Run(fakeM)
-Then  Run 返回 1
-And   fakeM.Run() 不被调用
-And   错误信息明确指出 "APP_PORT" 在容器 SUTEnv 与 cmd.Env 之间发生冲突
-```
-
-### TC-14 SUTEnv 成功注入 SUT 进程环境变量
-
-**说明**：容器 `Start()` 返回的 `SUTEnv` 在正常流程中应被框架注入到 SUT 子进程的环境变量中，SUT 进程可通过 `os.Getenv` 读取这些值。
-
-```gherkin
-Given 构造合法 Config，启用 SUT 托管
-And   RegisterContainersFunc 注册一个真实 Redis 容器，
-      Start 返回 SUTEnv = {"TEST_REDIS_ADDR": "<实际映射地址>"}
-And   SUTBootPlan.GetCommand 返回一个 helper 进程，
-      该进程启动后将自身 os.Getenv("TEST_REDIS_ADDR") 的值写入一个临时文件，然后监听探测端口
-# defer/t.Cleanup 注册兜底清理：强制停止 daemon 和 SUT 进程（如存活）、销毁容器（如存在）、删除 runtime.json（如存在）
+And   RegisterContainersFunc 注册一个真实 Redis 容器（Name 为 "redis"）
+And   SUTBootPlan.GetCommand 内部通过 Docker API 查询容器 "redis" 的映射端口，
+      将 "TEST_REDIS_ADDR=<实际地址>" 设入 cmd.Env
+And   SUT helper 进程启动后读取 os.Getenv("TEST_REDIS_ADDR")，
+      ping Redis 并将结果 "success"/"fail" 写入临时文件，然后阻塞保活
+# defer/t.Cleanup 注册兜底清理：强制停止 daemon 和 SUT 进程（如存活）、销毁容器 "redis"（如存在）、删除 runtime.json（如存在）
 When  调用 Run(fakeM)
 Then  Run 返回 0
-And   fakeM.Run() 内部读取临时文件，验证其内容等于容器实际映射的 Redis 地址，
-      证明框架确实将容器 SUTEnv 注入了 SUT 进程的环境变量
+And   fakeM.Run() 内部轮询读取临时文件，验证内容为 "success"，
+      证明调用方在 GetCommand 中设置的环境变量成功注入了 SUT 进程
 ```
 
 ---
@@ -265,9 +236,10 @@ And   RegisterContainersFunc 注册一个真实 Redis 容器
 # defer/t.Cleanup 注册兜底清理：强制停止 daemon（如存活）、销毁容器（如存在）、删除 runtime.json（如存在）
 When  调用 Run(fakeM)，fakeM.Run() 立即返回 0（lease 随即释放）
 Then  Run 返回 0
+And   fakeM.Run() 内通过 tcdruntime.Read() 获取 daemon PID
 And   在最多 10s 的容忍窗口内轮询断言（此处是核心行为验证）：
       - runtime.json 文件已被删除（框架 shutdownServer 的结果）
-      - daemon 进程已退出（PID 不再存活）
+      - daemon 进程已退出（通过 PID 存活检查验证）
       - 容器已不存在（框架显式 Terminate 的结果）
 ```
 
@@ -297,7 +269,7 @@ And   所有 client 执行 Release
 - [x] 涉及真实容器的用例均依赖真实 testcontainers-go 启动容器，不使用 mock/stub
 - [x] 失败用例的 Then 均可指向具体行为假设
 - [x] 覆盖了输入边界、异常恢复、部分成功时的回滚
-- [x] 覆盖了 SUTEnv 的正向注入与两条冲突检测路径（容器间、cmd.Env 与 SUTEnv）
+- [x] 覆盖了调用方在 GetCommand 中全权负责 SUT 环境变量注入的路径
 - [x] 覆盖了生命周期回收和并发安全场景
 - [x] 所有用例串行执行，不使用 t.Parallel()
 - [x] 所有涉及 Run() 的用例（TC-08 ~ TC-17）通过 defer/t.Cleanup 注册兜底清理，断言完成后主动清理残留产物

@@ -3,12 +3,9 @@
 package test
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,16 +14,30 @@ import (
 
 	tcd "github.com/McHarvvvy/testcontainerd"
 	"github.com/McHarvvvy/testcontainerd/container"
-	dockercontainer "github.com/docker/docker/api/types/container"
-	dockerclient "github.com/docker/docker/client"
+	"github.com/McHarvvvy/testcontainerd/tcdruntime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // ---------------------------------------------------------------------------
 // TC-08: 成功接管测试并透传退出码
+//
+// 说明：调用 Run(m) 时，框架应确保所注册的真实容器已启动且可用。
+// 最后将 m 的测试退出码如实向上透传。
+//
+// Given 构造合法 Config
+// And   RegisterContainersFunc 注册一个真实 Redis 容器，
+//
+//	注册项 Name 为 "redis"，Start 中设置 ContainerRequest.Name 与之一致
+//
+// # defer/t.Cleanup 注册兜底清理
+// When  调用 New() 后执行 Run(fakeM)
+// Then  Run 阻塞执行
+// And   fakeM.Run() 内部通过 Docker API 按容器名 "redis" inspect 获取映射端口，
+//
+//	并验证 Redis PING 连通性
+//
+// And   fakeM.Run() 返回 0 时 Run 返回 0；fakeM.Run() 返回 1 时 Run 返回 1
 // ---------------------------------------------------------------------------
 
 func TestTC08SuccessfulRunAndExitCodePassthrough(t *testing.T) {
@@ -51,18 +62,29 @@ func TestTC08SuccessfulRunAndExitCodePassthrough(t *testing.T) {
 		verified = true
 		return 0
 	}})
-	assert.Equal(t, 0, code)
-	assert.True(t, verified)
+	assert.Equal(t, 0, code, "Run should return 0 when fakeM returns 0")
+	assert.True(t, verified, "Redis PING inside Run should succeed, confirming container is live")
 
 	// 验证退出码 1 透传（第二次 Run 复用已有 daemon）
 	inst2, err := tcd.New(cfg, registerFn)
 	require.NoError(t, err)
 	code2 := inst2.Run(&fakeRunnable{run: func() int { return 1 }})
-	assert.Equal(t, 1, code2)
+	assert.Equal(t, 1, code2, "Run should pass through exit code 1 from fakeM")
 }
 
 // ---------------------------------------------------------------------------
 // TC-09: 连续执行测试框架复用底层基础设施
+//
+// 说明：调用方在多个连续的实例中多次调用框架，框架会自动复用已启动好的
+// 底层资源容器群，防止重复消耗机器性能。
+//
+// Given 构造合法 Config（IdleTTL 设置足够长以覆盖两次 Run 间隔）
+// And   RegisterContainersFunc 注册一个真实 Redis 容器
+// # defer/t.Cleanup 注册兜底清理
+// When  连续执行两次完全独立的 testcontainerd 实例的 Run(fakeM)
+// Then  两次 Run 调用都成功返回 0
+// And   两次 fakeM.Run() 内部通过 Docker API inspect 获取的容器 ID 相同
+// And   两次 fakeM.Run() 内通过 tcdruntime.Read() 获取的 daemon PID 相同
 // ---------------------------------------------------------------------------
 
 func TestTC09SequentialRunReusesSameContainer(t *testing.T) {
@@ -70,14 +92,18 @@ func TestTC09SequentialRunReusesSameContainer(t *testing.T) {
 	cfg := dockerTestConfig(t)
 	cfg.Daemon.IdleTTL = 15 * time.Second
 	registerFn := singleRedisRegisterFunc("redis")
-	t.Cleanup(func() { cleanupEnv("redis", cfg.Global.RuntimePath) })
+	runtimePath := cfg.Global.RuntimePath
+	t.Cleanup(func() { cleanupEnv("redis", runtimePath) })
 
 	var id1, id2 string
+	var pid1, pid2 int
 
 	inst1, err := tcd.New(cfg, registerFn)
 	require.NoError(t, err)
 	inst1.Run(&fakeRunnable{run: func() int {
 		id1, _ = containerIDByName(context.Background(), "redis")
+		info, _ := tcdruntime.Read(runtimePath)
+		pid1 = info.PID
 		return 0
 	}})
 
@@ -85,15 +111,34 @@ func TestTC09SequentialRunReusesSameContainer(t *testing.T) {
 	require.NoError(t, err)
 	inst2.Run(&fakeRunnable{run: func() int {
 		id2, _ = containerIDByName(context.Background(), "redis")
+		info, _ := tcdruntime.Read(runtimePath)
+		pid2 = info.PID
 		return 0
 	}})
 
 	require.NotEmpty(t, id1)
-	assert.Equal(t, id1, id2)
+	assert.Equal(t, id1, id2, "should reuse the same container")
+	require.NotZero(t, pid1)
+	assert.Equal(t, pid1, pid2, "should reuse the same daemon process")
 }
 
 // ---------------------------------------------------------------------------
 // TC-10: 容器部分启动失败触发全量回滚
+//
+// 说明：在测试运行前的容器启动阶段如果有任意一个发生错误，
+// 框架必须回滚所有已正常拉起的容器。
+//
+// Given 构造合法 Config
+// And   RegisterContainersFunc 返回两个 ContainerRegistration：
+//
+//	注册项 A：Start 正常启动真实 Redis 容器（Name 为 "redis-good"）
+//	注册项 B：Start 使用不存在的镜像，导致 testcontainers-go 报错
+//
+// # defer/t.Cleanup 注册兜底清理
+// When  调用 Run(fakeM)
+// Then  Run 返回 1
+// And   fakeM.Run() 不会被调用
+// And   Run 返回后单次验证容器 "redis-good" 已不存在（框架在 Run 返回前已完成回滚）
 // ---------------------------------------------------------------------------
 
 func TestTC10PartialStartFailureRollsBack(t *testing.T) {
@@ -116,13 +161,33 @@ func TestTC10PartialStartFailureRollsBack(t *testing.T) {
 		return 0
 	}})
 
-	assert.Equal(t, 1, code)
-	assert.False(t, fakeRan)
-	assertContainerGone(t, "redis-good", 10*time.Second)
+	assert.Equal(t, 1, code, "Run should return 1 when a container fails to start")
+	assert.False(t, fakeRan, "fakeM.Run() should not be called on startup failure")
+
+	// 单次验证：框架在 Run 返回前已完成回滚
+	exists, existsErr := containerExists(context.Background(), "redis-good")
+	require.NoError(t, existsErr)
+	assert.False(t, exists, "redis-good should be cleaned up before Run returns")
 }
 
 // ---------------------------------------------------------------------------
 // TC-11: Init 函数失败触发全量回滚
+//
+// 说明：所有容器启动成功后，如果某个注册项的 Init 函数返回错误，
+// 框架必须回滚所有已启动的容器。
+//
+// Given 构造合法 Config
+// And   RegisterContainersFunc 返回两个 ContainerRegistration：
+//
+//	注册项 A：Start 正常启动真实 Redis 容器（Name 为 "redis-a"），Init 为 nil
+//	注册项 B：Start 正常启动另一个真实 Redis 容器（Name 为 "redis-b"），
+//	          Init 函数返回 error
+//
+// # defer/t.Cleanup 注册兜底清理
+// When  调用 Run(fakeM)
+// Then  Run 返回 1
+// And   fakeM.Run() 不会被调用
+// And   Run 返回后单次验证两个容器均已不存在（框架在 Run 返回前已完成回滚）
 // ---------------------------------------------------------------------------
 
 func TestTC11InitFailureRollsBackAll(t *testing.T) {
@@ -148,104 +213,49 @@ func TestTC11InitFailureRollsBackAll(t *testing.T) {
 	inst, err := tcd.New(cfg, registerFn)
 	require.NoError(t, err)
 
-	code := inst.Run(&fakeRunnable{run: func() int { return 0 }})
+	var fakeRan bool
+	code := inst.Run(&fakeRunnable{run: func() int {
+		fakeRan = true
+		return 0
+	}})
 
-	assert.Equal(t, 1, code)
-	assertContainerGone(t, "redis-a", 10*time.Second)
-	assertContainerGone(t, "redis-b", 10*time.Second)
+	assert.Equal(t, 1, code, "Run should return 1 when Init fails")
+	assert.False(t, fakeRan, "fakeM.Run() should not be called on init failure")
+
+	// 单次验证：框架在 Run 返回前已完成回滚
+	exists1, _ := containerExists(context.Background(), "redis-a")
+	assert.False(t, exists1, "redis-a should be cleaned up before Run returns")
+	exists2, _ := containerExists(context.Background(), "redis-b")
+	assert.False(t, exists2, "redis-b should be cleaned up before Run returns")
 }
 
 // ---------------------------------------------------------------------------
-// TC-12: 多容器 SUTEnv key 跨注册项冲突
-// ---------------------------------------------------------------------------
-
-func TestTC12SUTEnvCrossRegistrationConflict(t *testing.T) {
-	requireDocker(t)
-	cfg := dockerTestConfig(t)
-	registerFn := func(ctx context.Context) ([]container.ContainerRegistration, error) {
-		return []container.ContainerRegistration{
-			{Name: "redis-a", Start: startRedisWithSUTEnv("redis-a", map[string]string{"DB_ADDR": "a:6379"})},
-			{Name: "redis-b", Start: startRedisWithSUTEnv("redis-b", map[string]string{"DB_ADDR": "b:6379"})},
-		}, nil
-	}
-	t.Cleanup(func() {
-		cleanupEnv("redis-a", cfg.Global.RuntimePath)
-		_ = cleanupContainerByName(context.Background(), "redis-b")
-	})
-
-	inst, err := tcd.New(cfg, registerFn)
-	require.NoError(t, err)
-
-	code := inst.Run(&fakeRunnable{run: func() int { return 0 }})
-
-	assert.Equal(t, 1, code)
-	assertContainerGone(t, "redis-a", 10*time.Second)
-	assertContainerGone(t, "redis-b", 10*time.Second)
-}
-
-// ---------------------------------------------------------------------------
-// TC-13: cmd.Env 与容器 SUTEnv key 冲突
-// ---------------------------------------------------------------------------
-
-func TestTC13CmdEnvSUTEnvConflict(t *testing.T) {
-	requireDocker(t)
-	probeAddr, err := reserveTCPAddr()
-	require.NoError(t, err)
-
-	cfg := dockerTestConfig(t)
-	cfg.SUT = conflictEnvSUT{probeAddr: probeAddr}
-	registerFn := func(ctx context.Context) ([]container.ContainerRegistration, error) {
-		return []container.ContainerRegistration{
-			{Name: "redis", Start: startRedisWithSUTEnv("redis", map[string]string{"APP_PORT": "3306"})},
-		}, nil
-	}
-	t.Cleanup(func() { cleanupEnv("redis", cfg.Global.RuntimePath) })
-
-	inst, err := tcd.New(cfg, registerFn)
-	require.NoError(t, err)
-
-	code := inst.Run(&fakeRunnable{run: func() int { return 0 }})
-
-	assert.Equal(t, 1, code)
-}
-
-// ---------------------------------------------------------------------------
-// TC-14: SUTEnv 成功注入 SUT 进程环境变量
+// TC-14: SUT 环境变量注入验证
+//
+// 说明：调用方在 GetCommand 中通过 Docker API 查询容器地址并设置 cmd.Env，
+// 框架负责用该 cmd 启动 SUT 进程。SUT 进程读取环境变量 ping Redis，
+// 写 "success"/"fail" 到文件，fakeM 轮询该文件验证结果。
+//
+// Given 构造合法 Config，启用 SUT 托管
+// And   RegisterContainersFunc 注册一个真实 Redis 容器
+// And   SUTBootPlan.GetCommand 通过 Docker API 查询容器地址，
+//
+//	设置 TEST_REDIS_ADDR=<实际地址> 到 cmd.Env
+//
+// And   SUT helper 进程读取 TEST_REDIS_ADDR，执行 Redis GET 命令，写 "success"/"fail" 到 envFile
+// # defer/t.Cleanup 注册兜底清理
+// When  调用 Run(fakeM)
+// Then  Run 返回 0
+// And   fakeM.Run() 内部轮询 envFile，验证内容为 "success"
 // ---------------------------------------------------------------------------
 
 func TestTC14SUTEnvInjectedIntoSUTProcess(t *testing.T) {
 	requireDocker(t)
 	envFile := filepath.Join(t.TempDir(), "sut_env_output.txt")
-	probeAddr, err := reserveTCPAddr()
-	require.NoError(t, err)
-
+	t.Cleanup(func() { _ = os.Remove(envFile) })
 	cfg := dockerTestConfig(t)
-	cfg.SUT = sutEnvVerifySUT{envFile: envFile, probeAddr: probeAddr}
-	registerFn := func(ctx context.Context) ([]container.ContainerRegistration, error) {
-		return []container.ContainerRegistration{
-			{Name: "redis", Start: func(ctx context.Context) (container.StartedContainer, error) {
-				ctr, ctrErr := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-					ContainerRequest: testcontainers.ContainerRequest{
-						Name:         "redis",
-						Image:        "redis:7.2-alpine",
-						ExposedPorts: []string{"6379/tcp"},
-						WaitingFor:   wait.ForListeningPort("6379/tcp"),
-					},
-					Started: true,
-				})
-				if ctrErr != nil {
-					return container.StartedContainer{}, ctrErr
-				}
-				host, _ := ctr.Host(ctx)
-				port, _ := ctr.MappedPort(ctx, "6379")
-				addr := net.JoinHostPort(host, port.Port())
-				return container.StartedContainer{
-					Container: ctr,
-					SUTEnv:    map[string]string{"TEST_REDIS_ADDR": addr},
-				}, nil
-			}},
-		}, nil
-	}
+	cfg.SUT = sutEnvVerifySUT{envFile: envFile}
+	registerFn := singleRedisRegisterFunc("redis")
 	t.Cleanup(func() { cleanupEnv("redis", cfg.Global.RuntimePath) })
 
 	inst, err := tcd.New(cfg, registerFn)
@@ -253,26 +263,38 @@ func TestTC14SUTEnvInjectedIntoSUTProcess(t *testing.T) {
 
 	var verified bool
 	code := inst.Run(&fakeRunnable{run: func() int {
-		data, readErr := os.ReadFile(envFile)
-		if readErr != nil {
-			return 1
+		// 轮询等待 SUT 写入结果
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			data, readErr := os.ReadFile(envFile)
+			if readErr == nil && len(data) > 0 {
+				content := strings.TrimSpace(string(data))
+				if content == "success" {
+					verified = true
+					return 0
+				}
+				return 1 // "fail" 或其他内容
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
-		actualAddr, inspectErr := redisAddressByContainerName(context.Background(), "redis")
-		if inspectErr != nil {
-			return 1
-		}
-		if strings.TrimSpace(string(data)) != actualAddr {
-			return 1
-		}
-		verified = true
-		return 0
+		return 1 // timeout
 	}})
-	assert.Equal(t, 0, code)
-	assert.True(t, verified)
+	assert.Equal(t, 0, code, "Run should return 0 when SUT env injection and Redis GET succeed")
+	assert.True(t, verified, "SUT helper should write 'success' after Redis GET command")
 }
 
 // ---------------------------------------------------------------------------
 // TC-15: SUT 就绪探测保证 fakeM.Run() 执行时端口已就绪
+//
+// 说明：SUT 开启服务探活时，框架承诺给到 m 实例的环境不仅拉起成功，
+// 更是网络服务完成就绪的。进入 m.Run() 时目标探测端口必定已就绪可连。
+//
+// Given 构造包含启用真实 SUT 探活计划（探测某一端口）的合法 Config
+// And   真实被测 SUT 进程模拟启动延迟：延迟耗时 300ms 后才绑定目标监听端口
+// # defer/t.Cleanup 注册兜底清理
+// When  调用 Run(fakeM)
+// Then  fakeM.Run() 内部对 SUT 监听端口发起 TCP 连接，连接成功
+// And   Run 正常返回 0
 // ---------------------------------------------------------------------------
 
 func TestTC15SUTProbeReadyBeforeFakeMRun(t *testing.T) {
@@ -296,12 +318,26 @@ func TestTC15SUTProbeReadyBeforeFakeMRun(t *testing.T) {
 		probeOK = true
 		return 0
 	}})
-	assert.Equal(t, 0, code)
-	assert.True(t, probeOK)
+	assert.Equal(t, 0, code, "Run should return 0 after SUT probe passes")
+	assert.True(t, probeOK, "TCP probe to SUT port should succeed before fakeM.Run() is entered")
 }
 
 // ---------------------------------------------------------------------------
 // TC-16: Daemon 空闲退出
+//
+// 说明：当所有 lease 释放且无新请求时，daemon 应在 IdleTTL 超时后
+// 自动退出并清理 runtime 文件。
+//
+// Given 构造合法 Config，Daemon.IdleTTL 设置为 1s
+// And   RegisterContainersFunc 注册一个真实 Redis 容器
+// # defer/t.Cleanup 注册兜底清理
+// When  调用 Run(fakeM)，fakeM.Run() 记录 daemon PID 后立即返回 0
+// Then  Run 返回 0
+// And   在最多 10s 的容忍窗口内轮询断言：
+//   - runtime.json 文件已被删除
+//   - daemon 进程已退出（PID 不再存活）
+//   - 容器已不存在
+//
 // ---------------------------------------------------------------------------
 
 func TestTC16DaemonIdleExitCleansUp(t *testing.T) {
@@ -315,24 +351,45 @@ func TestTC16DaemonIdleExitCleansUp(t *testing.T) {
 	inst, err := tcd.New(cfg, registerFn)
 	require.NoError(t, err)
 
-	code := inst.Run(&fakeRunnable{run: func() int { return 0 }})
-	assert.Equal(t, 0, code)
+	var daemonPID int
+	code := inst.Run(&fakeRunnable{run: func() int {
+		info, readErr := tcdruntime.Read(runtimePath)
+		if readErr != nil {
+			return 1
+		}
+		daemonPID = info.PID
+		return 0
+	}})
+	assert.Equal(t, 0, code, "Run should return 0 before daemon idle recycle starts")
+	require.NotZero(t, daemonPID)
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		_, statErr := os.Stat(runtimePath)
 		runtimeGone := os.IsNotExist(statErr)
 		exists, existsErr := containerExists(context.Background(), "redis")
-		if existsErr == nil && runtimeGone && !exists {
+		containerGone := existsErr == nil && !exists
+		daemonGone := !processAlive(daemonPID)
+		if runtimeGone && containerGone && daemonGone {
 			return
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	t.Fatal("daemon idle exit timeout: runtime or container still exists")
+	t.Fatal("daemon idle exit timeout: runtime, container, or daemon process still exists")
 }
 
 // ---------------------------------------------------------------------------
 // TC-17: 多 client 并发 Acquire 复用同一容器
+//
+// 说明：go test ./... 场景下多个测试进程并发请求 daemon，所有请求应成功
+// 获取 lease 并共享同一组容器。
+//
+// Given 构造合法 Config
+// And   RegisterContainersFunc 注册一个真实 Redis 容器（Name 为 "redis"）
+// # defer/t.Cleanup 注册兜底清理
+// When  3 个独立 goroutine 并发执行 New() + Run(fakeM)
+// Then  所有 Run 成功返回 0
+// And   通过 Docker API inspect 容器 "redis"，验证只有一个 Redis 容器在运行
 // ---------------------------------------------------------------------------
 
 func TestTC17ConcurrentRunReusesSameContainer(t *testing.T) {
@@ -366,374 +423,5 @@ func TestTC17ConcurrentRunReusesSameContainer(t *testing.T) {
 	for id := range containerIDs {
 		ids[id] = struct{}{}
 	}
-	assert.Len(t, ids, 1)
-}
-
-// ===========================================================================
-// fakeRunnable — 测试用 Runnable 实现
-// ===========================================================================
-
-type fakeRunnable struct {
-	run func() int
-}
-
-func (f *fakeRunnable) Run() int { return f.run() }
-
-// ===========================================================================
-// SUTBootPlan 实现
-// ===========================================================================
-
-// delayedProbeSUT — TC-15: 模拟延迟启动后监听探测端口的 SUT。
-type delayedProbeSUT struct {
-	probeAddr string
-}
-
-func (d delayedProbeSUT) IsEnable() bool                 { return true }
-func (d delayedProbeSUT) GetIdleTTL() time.Duration      { return 2 * time.Second }
-func (d delayedProbeSUT) GetReadyTimeout() time.Duration { return 10 * time.Second }
-func (d delayedProbeSUT) GetGracePeriod() time.Duration  { return 2 * time.Second }
-func (d delayedProbeSUT) GetProbeAddrs() []string        { return []string{d.probeAddr} }
-func (d delayedProbeSUT) GetCommand(_ context.Context, _ tcd.StartSUTInput) (*exec.Cmd, error) {
-	cmd := exec.Command(os.Args[0], "-test.run=TestHelperDelayedProbeSUT")
-	cmd.Env = append(os.Environ(), "TCD_HELPER_PROCESS=1", "TCD_HELPER_PROBE_ADDR="+d.probeAddr)
-	cmd.Dir = os.TempDir()
-	return cmd, nil
-}
-
-var _ tcd.SUTBootPlan = delayedProbeSUT{}
-
-// conflictEnvSUT — TC-13: GetCommand 返回 cmd.Env 中含 "APP_PORT=8080"，与容器 SUTEnv 冲突。
-type conflictEnvSUT struct {
-	probeAddr string
-}
-
-func (c conflictEnvSUT) IsEnable() bool                 { return true }
-func (c conflictEnvSUT) GetIdleTTL() time.Duration      { return 2 * time.Second }
-func (c conflictEnvSUT) GetReadyTimeout() time.Duration { return 10 * time.Second }
-func (c conflictEnvSUT) GetGracePeriod() time.Duration  { return 2 * time.Second }
-func (c conflictEnvSUT) GetProbeAddrs() []string        { return []string{c.probeAddr} }
-func (c conflictEnvSUT) GetCommand(_ context.Context, _ tcd.StartSUTInput) (*exec.Cmd, error) {
-	cmd := exec.Command(os.Args[0], "-test.run=TestHelperDelayedProbeSUT")
-	cmd.Env = append(os.Environ(), "TCD_HELPER_PROCESS=1", "TCD_HELPER_PROBE_ADDR="+c.probeAddr, "APP_PORT=8080")
-	cmd.Dir = os.TempDir()
-	return cmd, nil
-}
-
-var _ tcd.SUTBootPlan = conflictEnvSUT{}
-
-// sutEnvVerifySUT — TC-14: SUT helper 读取 TEST_REDIS_ADDR 写入文件后监听探测端口。
-type sutEnvVerifySUT struct {
-	envFile   string
-	probeAddr string
-}
-
-func (s sutEnvVerifySUT) IsEnable() bool                 { return true }
-func (s sutEnvVerifySUT) GetIdleTTL() time.Duration      { return 2 * time.Second }
-func (s sutEnvVerifySUT) GetReadyTimeout() time.Duration { return 10 * time.Second }
-func (s sutEnvVerifySUT) GetGracePeriod() time.Duration  { return 2 * time.Second }
-func (s sutEnvVerifySUT) GetProbeAddrs() []string        { return []string{s.probeAddr} }
-func (s sutEnvVerifySUT) GetCommand(_ context.Context, _ tcd.StartSUTInput) (*exec.Cmd, error) {
-	cmd := exec.Command(os.Args[0], "-test.run=TestHelperSUTEnvVerify")
-	cmd.Env = append(os.Environ(),
-		"TCD_HELPER_PROCESS=1",
-		"TCD_HELPER_ENV_FILE="+s.envFile,
-		"TCD_HELPER_PROBE_ADDR="+s.probeAddr,
-	)
-	cmd.Dir = os.TempDir()
-	return cmd, nil
-}
-
-var _ tcd.SUTBootPlan = sutEnvVerifySUT{}
-
-// ===========================================================================
-// Test helper 进程（通过 re-exec 模式运行）
-// ===========================================================================
-
-// TestHelperDelayedProbeSUT — TC-15 的 SUT helper 进程：延迟后监听探测端口。
-func TestHelperDelayedProbeSUT(t *testing.T) {
-	if os.Getenv("TCD_HELPER_PROCESS") != "1" {
-		return
-	}
-	addr := strings.TrimSpace(os.Getenv("TCD_HELPER_PROBE_ADDR"))
-	if addr == "" {
-		os.Exit(2)
-	}
-	time.Sleep(300 * time.Millisecond)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		os.Exit(3)
-	}
-	defer ln.Close()
-	for {
-		conn, acceptErr := ln.Accept()
-		if acceptErr != nil {
-			return
-		}
-		_ = conn.Close()
-	}
-}
-
-// TestHelperSUTEnvVerify — TC-14 的 SUT helper 进程：读取 TEST_REDIS_ADDR 写入文件后监听探测端口。
-func TestHelperSUTEnvVerify(t *testing.T) {
-	if os.Getenv("TCD_HELPER_PROCESS") != "1" {
-		return
-	}
-	envFile := strings.TrimSpace(os.Getenv("TCD_HELPER_ENV_FILE"))
-	probeAddr := strings.TrimSpace(os.Getenv("TCD_HELPER_PROBE_ADDR"))
-	if envFile == "" || probeAddr == "" {
-		os.Exit(2)
-	}
-	redisAddr := os.Getenv("TEST_REDIS_ADDR")
-	if err := os.WriteFile(envFile, []byte(redisAddr), 0o644); err != nil {
-		os.Exit(3)
-	}
-	ln, err := net.Listen("tcp", probeAddr)
-	if err != nil {
-		os.Exit(4)
-	}
-	defer ln.Close()
-	for {
-		conn, acceptErr := ln.Accept()
-		if acceptErr != nil {
-			return
-		}
-		_ = conn.Close()
-	}
-}
-
-// ===========================================================================
-// 辅助函数：配置构造
-// ===========================================================================
-
-func dockerTestConfig(t *testing.T) tcd.Config {
-	t.Helper()
-	return tcd.Config{
-		Global: tcd.GlobalConfig{
-			Project:     fmt.Sprintf("test-%d", time.Now().UnixNano()),
-			RuntimePath: filepath.Join(t.TempDir(), "runtime.json"),
-		},
-		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 5 * time.Second},
-		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
-	}
-}
-
-func singleRedisRegisterFunc(name string) tcd.RegisterContainersFunc {
-	return func(ctx context.Context) ([]container.ContainerRegistration, error) {
-		return []container.ContainerRegistration{
-			{Name: name, Start: startRealRedis(name)},
-		}, nil
-	}
-}
-
-// ===========================================================================
-// 辅助函数：容器 Start 工厂
-// ===========================================================================
-
-func startRealRedis(name string) func(ctx context.Context) (container.StartedContainer, error) {
-	return func(ctx context.Context) (container.StartedContainer, error) {
-		ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Name:         name,
-				Image:        "redis:7.2-alpine",
-				ExposedPorts: []string{"6379/tcp"},
-				WaitingFor:   wait.ForListeningPort("6379/tcp"),
-			},
-			Started: true,
-		})
-		if err != nil {
-			return container.StartedContainer{}, err
-		}
-		return container.StartedContainer{
-			Container: ctr,
-			SUTEnv:    map[string]string{},
-		}, nil
-	}
-}
-
-func startBadImage(name string) func(ctx context.Context) (container.StartedContainer, error) {
-	return func(ctx context.Context) (container.StartedContainer, error) {
-		ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Name:         name,
-				Image:        "redis:non-existent-tag-for-testcontainerd",
-				ExposedPorts: []string{"6379/tcp"},
-				WaitingFor:   wait.ForListeningPort("6379/tcp"),
-			},
-			Started: true,
-		})
-		if err != nil {
-			return container.StartedContainer{}, err
-		}
-		return container.StartedContainer{Container: ctr}, nil
-	}
-}
-
-func startRedisWithSUTEnv(name string, env map[string]string) func(ctx context.Context) (container.StartedContainer, error) {
-	return func(ctx context.Context) (container.StartedContainer, error) {
-		ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Name:         name,
-				Image:        "redis:7.2-alpine",
-				ExposedPorts: []string{"6379/tcp"},
-				WaitingFor:   wait.ForListeningPort("6379/tcp"),
-			},
-			Started: true,
-		})
-		if err != nil {
-			return container.StartedContainer{}, err
-		}
-		return container.StartedContainer{
-			Container: ctr,
-			SUTEnv:    env,
-		}, nil
-	}
-}
-
-// ===========================================================================
-// 辅助函数：Docker 操作
-// ===========================================================================
-
-func requireDocker(t *testing.T) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
-	if err != nil {
-		t.Skipf("docker client unavailable: %v", err)
-	}
-	defer cli.Close()
-	if _, err = cli.Ping(ctx); err != nil {
-		t.Skipf("docker daemon unavailable: %v", err)
-	}
-}
-
-func containerExists(ctx context.Context, name string) (bool, error) {
-	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
-	if err != nil {
-		return false, err
-	}
-	defer cli.Close()
-	_, err = cli.ContainerInspect(ctx, name)
-	if err == nil {
-		return true, nil
-	}
-	if strings.Contains(strings.ToLower(err.Error()), "no such container") || strings.Contains(err.Error(), "not found") {
-		return false, nil
-	}
-	return false, err
-}
-
-func containerIDByName(ctx context.Context, name string) (string, error) {
-	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
-	if err != nil {
-		return "", err
-	}
-	defer cli.Close()
-	inspect, err := cli.ContainerInspect(ctx, name)
-	if err != nil {
-		return "", err
-	}
-	return inspect.ID, nil
-}
-
-func redisAddressByContainerName(ctx context.Context, name string) (string, error) {
-	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
-	if err != nil {
-		return "", err
-	}
-	defer cli.Close()
-	inspect, err := cli.ContainerInspect(ctx, name)
-	if err != nil {
-		return "", err
-	}
-	pb, ok := inspect.NetworkSettings.Ports["6379/tcp"]
-	if !ok || len(pb) == 0 {
-		return "", fmt.Errorf("redis mapped port not found")
-	}
-	host := pb[0].HostIP
-	if host == "" || host == "0.0.0.0" {
-		host = "127.0.0.1"
-	}
-	return net.JoinHostPort(host, pb[0].HostPort), nil
-}
-
-func cleanupContainerByName(ctx context.Context, name string) error {
-	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
-	if err != nil {
-		return err
-	}
-	defer cli.Close()
-	return cli.ContainerRemove(ctx, name, dockercontainer.RemoveOptions{Force: true, RemoveVolumes: true})
-}
-
-func cleanupEnv(containerName, runtimePath string) {
-	ctx := context.Background()
-	_ = cleanupContainerByName(ctx, containerName)
-	_ = os.Remove(runtimePath)
-}
-
-func assertContainerGone(t *testing.T, name string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		exists, err := containerExists(context.Background(), name)
-		if err == nil && !exists {
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	t.Fatalf("container %q still exists after %v", name, timeout)
-}
-
-// ===========================================================================
-// 辅助函数：网络
-// ===========================================================================
-
-func pingRedis(addr string) error {
-	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if err = conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		return err
-	}
-	if _, err = conn.Write([]byte("*1\r\n$4\r\nPING\r\n")); err != nil {
-		return err
-	}
-	line, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(line) != "+PONG" {
-		return fmt.Errorf("unexpected redis response: %q", line)
-	}
-	return nil
-}
-
-func reserveTCPAddr() (string, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", err
-	}
-	addr := ln.Addr().String()
-	if err = ln.Close(); err != nil {
-		return "", err
-	}
-	return addr, nil
-}
-
-func probeTCP(addr string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return err
-		}
-		time.Sleep(80 * time.Millisecond)
-	}
+	assert.Len(t, ids, 1, "all concurrent Runs should share the same container")
 }

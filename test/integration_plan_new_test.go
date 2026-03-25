@@ -13,13 +13,14 @@ import (
 	"github.com/McHarvvvy/testcontainerd/tcdruntime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
 )
 
 func TestTC01NewFillsDefaultProjectAndRuntimePath(t *testing.T) {
 	tcdInst, err := tcd.New(validConfig(), validRegisterFunc("redis"))
 	require.NoError(t, err)
 	require.NotNil(t, tcdInst)
-	assert.Equal(t, tcdruntime.DefaultRuntimePath("default"), tcdInst.RuntimePath())
+	assert.Equal(t, tcdruntime.DefaultRuntimePath("default"), tcdInst.RuntimePath(), "New() with empty Project should use default RuntimePath")
 }
 
 func TestTC02NewRejectsInvalidKeyFieldsExceptGlobalDefaults(t *testing.T) {
@@ -57,21 +58,21 @@ func TestTC02NewRejectsInvalidKeyFieldsExceptGlobalDefaults(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := tcd.New(tt.cfg, validRegisterFunc("redis"))
-			assert.Error(t, err)
+			assert.Error(t, err, "New() should reject config: %s", tt.name)
 		})
 	}
 }
 
 func TestTC03NewRejectsNilRegisterContainersFunc(t *testing.T) {
 	_, err := tcd.New(validConfig(), nil)
-	assert.Error(t, err)
+	assert.Error(t, err, "New() should reject nil RegisterContainersFunc")
 }
 
 func TestTC04NewRejectsEmptyContainerRegistrationList(t *testing.T) {
 	_, err := tcd.New(validConfig(), func(context.Context) ([]container.ContainerRegistration, error) {
 		return []container.ContainerRegistration{}, nil
 	})
-	assert.Error(t, err)
+	assert.Error(t, err, "New() should reject empty ContainerRegistration list")
 }
 
 func TestTC05NewRejectsDuplicatedContainerName(t *testing.T) {
@@ -81,7 +82,7 @@ func TestTC05NewRejectsDuplicatedContainerName(t *testing.T) {
 			{Name: "redis", Start: startNoop},
 		}, nil
 	})
-	assert.Error(t, err)
+	assert.Error(t, err, "New() should reject duplicate container name")
 }
 
 func TestTC06NewRejectsInvalidContainerRegistrationFields(t *testing.T) {
@@ -89,14 +90,14 @@ func TestTC06NewRejectsInvalidContainerRegistrationFields(t *testing.T) {
 		_, err := tcd.New(validConfig(), func(context.Context) ([]container.ContainerRegistration, error) {
 			return []container.ContainerRegistration{{Name: "", Start: startNoop}}, nil
 		})
-		assert.Error(t, err)
+		assert.Error(t, err, "New() should reject registration with empty name")
 	})
 
 	t.Run("start is nil", func(t *testing.T) {
 		_, err := tcd.New(validConfig(), func(context.Context) ([]container.ContainerRegistration, error) {
 			return []container.ContainerRegistration{{Name: "redis", Start: nil}}, nil
 		})
-		assert.Error(t, err)
+		assert.Error(t, err, "New() should reject registration with nil Start func")
 	})
 }
 
@@ -106,7 +107,7 @@ func TestTC07NewPropagatesRegisterContainersError(t *testing.T) {
 		return nil, expectErr
 	})
 	require.Error(t, err)
-	assert.ErrorIs(t, err, expectErr)
+	assert.ErrorIs(t, err, expectErr, "New() should propagate error from RegisterContainersFunc")
 }
 
 func validConfig() tcd.Config {
@@ -123,6 +124,6 @@ func validRegisterFunc(name string) tcd.RegisterContainersFunc {
 	}
 }
 
-func startNoop(context.Context) (container.StartedContainer, error) {
-	return container.StartedContainer{SUTEnv: map[string]string{}}, nil
+func startNoop(context.Context) (testcontainers.Container, error) {
+	return nil, nil
 }

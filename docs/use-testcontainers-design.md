@@ -16,12 +16,12 @@ SUT 启动阶段，`StartSUTInput.Resources` 将上述连接信息传入 `SUTBoo
 
 ### 修改动机
 
-去掉框架对容器配置的二次封装，让调用方直接使用 `testcontainers-go` 原生 API 启动容器。SUT 环境变量的注入改为两段式、由框架统一合并：
+去掉框架对容器配置的二次封装，让调用方直接使用 `testcontainers-go` 原生 API 启动容器。SUT 环境变量由调用方在 `GetCommand()` 的 `cmd.Env` 中统一定义，框架不参与聚合或合并：
 
-- **容器侧**：各 `ContainerRegistration.Start()` 返回连接类 `SUTEnv`，框架在 daemon 内聚合，key 冲突立即报错。
-- **SUT 侧**：`GetCommand` 在 `cmd.Env` 中声明 SUT 进程专属的静态配置（如 `MSSIOT_ENV`、`MSSIOT_REGION`），框架将其与容器 `SUTEnv` 合并，key 冲突立即报错，最终注入 cmd 启动 SUT。
+- **容器侧**：`ContainerRegistration.Start()` 只返回 `testcontainers.Container`，框架托管其生命周期。
+- **SUT 侧**：`GetCommand` 在 `cmd.Env` 中声明 SUT 进程所需的全部环境变量（容器连接信息 + 静态配置），调用方可在 `GetCommand()` 内通过 Docker API 按容器名查询连接地址后自行构造 env。
 
-调用方无需自行合并两类变量，各自只声明各自范围内的内容。
+调用方对 SUT 进程环境变量拥有完整控制权，使用 map 承接天然不会出现键冲突。
 
 ---
 
@@ -31,8 +31,8 @@ SUT 启动阶段，`StartSUTInput.Resources` 将上述连接信息传入 `SUTBoo
 
 - 将容器注册 API 从 `InstanceConfig`（框架定义字段）替换为 `ContainerRegistration`（调用方提供 `Start` 函数）。
 - 废弃 `container/spec/` 和 `spec.Driver` 驱动体系，彻底解除框架对中间件类型的硬依赖。
-- 容器连接信息由各 `Start()` 以 `SUTEnv` 的形式汇报，框架聚合后通过 `StartSUTInput.SUTEnv` 传入 `GetCommand`（供参考），同时由框架注入 SUT 进程。
-- `GetCommand` 通过 `cmd.Env` 声明 SUT 进程专属的静态配置；框架将 `cmd.Env` 与容器 `SUTEnv` 在 daemon 层合并，key 冲突报错，然后统一注入 cmd。
+- `Start()` 只返回 `testcontainers.Container`，框架托管其生命周期，不参与环境变量传递。
+- `GetCommand` 由调用方全权负责 SUT 进程的所有环境变量（容器连接信息 + 静态配置），框架不做聚合、合并或冲突检测。
 - `AcquireResp` 只保留租约字段（`lease_id`、`acquired_at`），不再携带任何连接信息。
 - 保持现有的双层租约、Reaper、幂等回滚、并发启动、逆序停止等核心机制不变。
 
@@ -63,19 +63,12 @@ SUT 启动阶段，`StartSUTInput.Resources` 将上述连接信息传入 `SUTBoo
 ### 1. `ContainerRegistration`（`container` 包，替换 `InstanceConfig`）
 
 ```go
-// StartedContainer 是调用方 Start 函数的返回值。
-// Container 用于框架托管生命周期；SUTEnv 是该容器贡献给 SUT 进程的连接信息。
-type StartedContainer struct {
-    Container testcontainers.Container
-    SUTEnv    map[string]string
-}
-
 // ContainerRegistration 表示单个容器注册项。
 type ContainerRegistration struct {
     // Name 是注册项唯一标识，建议与容器 Name 保持一致，用于回滚、清理和日志。
     Name  string
-    // Start 负责创建并启动容器，返回容器句柄和该注册项贡献的连接类 SUT 环境变量。
-    Start func(ctx context.Context) (StartedContainer, error)
+    // Start 负责创建并启动容器，返回容器句柄，由框架托管生命周期。
+    Start func(ctx context.Context) (testcontainers.Container, error)
     // Init 在所有容器启动后执行（可选），可用于建库、写种子数据等初始化操作。
     Init  func(ctx context.Context) error
 }
@@ -86,7 +79,6 @@ type ContainerRegistration struct {
 - `Name` 和 `Start` 均不得为空，否则 `Bundle` 构建时立即返回错误。
 - `Init` 为 `nil` 时跳过，不报错。
 - 同一 `Name` 不得重复，`Bundle` 构建时检测，重复即报错。
-- 各注册项返回的 `SUTEnv` key 不得跨注册项重复；聚合阶段检测到冲突时 fail-fast，报告冲突双方的注册名，并触发全量回滚。
 
 ### 2. `RegisterContainersFunc`（`testcontainerd` 包顶层）
 
@@ -104,30 +96,20 @@ type RegisterContainersFunc func(ctx context.Context) ([]container.ContainerRegi
 ### 3. `StartSUTInput` 与 `GetCommand` 语义（`daemon` 包）
 
 ```go
-// StartSUTInput 定义被测服务启动输入（去掉 Resources，新增 SUTEnv）。
+// StartSUTInput 定义被测服务启动输入。
 type StartSUTInput struct {
     Project     string
     RuntimePath string
-    // SUTEnv 是由所有容器注册项 Start() 返回的连接类环境变量聚合而成，
-    // 供 GetCommand 实现方参考（如动态决定使用哪个容器的连接信息）。
-    // 框架会统一将其注入 SUT 进程，实现方无需自行写入 cmd.Env。
-    SUTEnv map[string]string
 }
 ```
 
 **`GetCommand` 的职责与 `cmd.Env` 语义：**
 
-- `GetCommand` 负责构建启动命令本身（路径、工作目录、参数）。
-- 若需要向 SUT 进程注入**与容器无关的静态配置**（如 `MSSIOT_ENV`、`MSSIOT_REGION`），通过 `cmd.Env` 声明，框架将其与 `SUTEnv` 合并后注入，key 冲突即报错拒绝启动。
-- `cmd.Env` 中**不应包含**已由 `SUTEnv` 覆盖的 key（容器连接类变量由框架统一注入，无需重复声明）。
-- `cmd.Env` 为空时，框架仅注入 `SUTEnv`；若还需继承宿主机环境，调用方应在 `cmd.Env` 中显式包含 `os.Environ()`。
+- `GetCommand` 负责构建启动命令本身（路径、工作目录、参数）以及 SUT 进程所需的**全部环境变量**。
+- 调用方在 `cmd.Env` 中声明 SUT 进程所需的所有环境变量，包括容器连接信息（如 `TEST_REDIS_ADDR`）和静态配置（如 `MSSIOT_ENV`、`MSSIOT_REGION`）。
+- `cmd.Env` 为空时，框架使用 `os.Environ()` 作为默认值。
+- 框架不做任何环境变量聚合、合并或冲突检测——调用方对 SUT 进程环境变量拥有完整控制权。
 - `SUTBootPlan` 接口中的 `SetEnvEndpoint()` 方法随此次重构一并删除。
-
-**框架侧 env 合并逻辑（`ensureStarted` 内部）：**
-
-1. 取 `GetCommand` 返回的 `cmd.Env`（SUT 静态配置，可能含 `os.Environ()`）。
-2. 将 `StartSUTInput.SUTEnv`（容器连接信息）逐 key 合并进 `cmd.Env`；若发现 key 重叠，报错并拒绝启动。
-3. 用合并后的 env 替换 `cmd.Env` 后执行 `cmd.Start()`。
 
 ### 4. `AcquireResp`（`protocol` 包，最小化）
 
@@ -144,8 +126,8 @@ type AcquireResp struct {
 ### 5. `Bundle.StartAll` 返回值变更（`container` 包）
 
 ```go
-// StartAll 启动全部依赖容器，返回各注册项 SUTEnv 聚合后的连接信息。
-func (b *Bundle) StartAll(ctx context.Context) (map[string]string, error)
+// StartAll 启动全部依赖容器。
+func (b *Bundle) StartAll(ctx context.Context) error
 ```
 
 `Bundle.Endpoints()` 方法删除；`Bundle.Containers()` 只返回注册名列表，去掉 `type/name` 格式。
@@ -181,20 +163,17 @@ daemon.handleAcquire()
     ├─ ensureInfraStarted()
     │   ├─ bundle.StartAll()
     │   │   ├─ 并发调用各 ContainerRegistration.Start()
-    │   │   │   └─ 调用方原生 testcontainers-go 逻辑，返回 (Container, SUTEnv)
-    │   │   ├─ 聚合各容器 SUTEnv（key 冲突 → fail-fast + 全量回滚）
+    │   │   │   └─ 调用方原生 testcontainers-go 逻辑，返回 testcontainers.Container
     │   │   └─ 顺序调用各 ContainerRegistration.Init()
-    │   └─ 返回 containerSUTEnv（仅含容器连接信息）
-    ├─ ensureSUTStarted(containerSUTEnv)
+    │   └─ 容器就绪
+    ├─ ensureSUTStarted()
     │   └─ sutManager.ensureStarted()
-    │       ├─ boot.GetCommand(ctx, StartSUTInput{SUTEnv: containerSUTEnv})
-    │       │   └─ 返回 cmd（cmd.Env 含调用方声明的静态 SUT 配置）
-    │       ├─ mergeEnv(cmd.Env, containerSUTEnv)（key 冲突 → 报错拒绝启动）
-    │       └─ cmd.Start()（使用合并后的 env）
+    │       ├─ boot.GetCommand(ctx, StartSUTInput{Project, RuntimePath})
+    │       │   └─ 调用方在 cmd.Env 中设置全部 SUT 环境变量
+    │       └─ cmd.Start()（使用调用方设置的 cmd.Env）
     └─ lease.Acquire() → LeaseID + AcquiredAt
 
-client 侧收到 LeaseID，测试代码从 os.Getenv() 读取 SUT 地址等信息
-（SUT 进程 env = 调用方静态配置 + 容器连接信息，由框架统一注入）
+client 侧收到 LeaseID，调用 m.Run()
 ```
 
 注：以上是框架内部执行路径。对调用方而言，仅需调用 `Run(m)` 并基于其返回值与环境可用性进行断言，不需要感知 client/daemon 的分支细节。
@@ -203,14 +182,14 @@ client 侧收到 LeaseID，测试代码从 os.Getenv() 读取 SUT 地址等信�
 
 | 模块                                | 变更类型    | 核心变化                                                                                                                              |
 | ----------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `container/options.go`              | 删除 + 重建 | 删除 `InstanceConfig`、`WithType` 等，新增 `ContainerRegistration`、`StartedContainer`                                                |
+| `container/options.go`              | 删除 + 重建 | 删除 `InstanceConfig`、`WithType`、`StartedContainer` 等；新增 `ContainerRegistration`（`Start` 返回 `testcontainers.Container`）     |
 | `container/registry.go`             | 删除        | `Registry` 全局状态不再需要；校验逻辑上移至 `Bundle` 构建时                                                                           |
-| `container/bundle.go`               | 重构        | `NewBundle` 接收 `[]ContainerRegistration`；`StartAll` 返回 `map[string]string`；新增 SUTEnv 聚合与冲突检测；删除 `Endpoints()`       |
+| `container/bundle.go`               | 重构        | `NewBundle` 接收 `[]ContainerRegistration`；`StartAll` 返回 `error`；删除 `Endpoints()`                                               |
 | `container/drivers.go`              | 删除        | 框架不再构建 `ContainerRequest`                                                                                                       |
 | `container/spec/`                   | 删除        | 彻底移除 spec.Driver 体系                                                                                                             |
 | `protocol/types.go`                 | 修改        | 删除 `ResourceEndpoint`、`AcquireResp.Resources`                                                                                      |
-| `daemon/sut_manager.go`             | 修改        | `StartSUTInput` 去掉 `Resources`，加入 `SUTEnv`；`ensureStarted` 新增 env 合并与冲突检测                                              |
-| `daemon/server.go` / `lifecycle.go` | 修改        | `New` 接收 `[]ContainerRegistration`（替代 `*Registry`）；`ensureInfraStarted` 返回 `SUTEnv`；`handleAcquire` 响应精简                |
+| `daemon/sut_manager.go`             | 修改        | `StartSUTInput` 去掉 `Resources` 和 `SUTEnv`；`ensureStarted` 不做 env 合并                                                           |
+| `daemon/server.go` / `lifecycle.go` | 修改        | `New` 接收 `[]ContainerRegistration`（替代 `*Registry`）；`ensureInfraStarted` 返回 `error`；`handleAcquire` 响应精简                 |
 | `client/client.go`                  | 修改        | `Acquire` 返回 `LeaseInfo`（无 Resources）                                                                                            |
 | `testcontainerd.go`                 | 修改        | 删除 `Registrar` 接口、`RegisterContainersHook`、`registryRegistrar`；新增 `RegisterContainersFunc`；删除 `SUT.SetEnvEndpoint()` 调用 |
 | `constant/container.go`             | 清理        | 删除仅服务于 spec 的类型常量                                                                                                          |
@@ -229,20 +208,18 @@ client 侧收到 LeaseID，测试代码从 os.Getenv() 读取 SUT 地址等信�
 
 ---
 
-### KTD-2：SUT 环境变量分两段声明，由框架统一合并注入
+### KTD-2：SUT 环境变量由调用方在 GetCommand 中全权负责
 
-**决策**：SUT 进程最终收到的环境变量由两部分构成，分别通过两条独立路径声明，框架在 `ensureStarted` 内串行合并，任一 key 冲突立即报错拒绝启动：
+**决策**：SUT 进程的环境变量完全由调用方在 `SUTBootPlan.GetCommand()` 返回的 `cmd.Env` 中定义。框架不参与环境变量的聚合、合并或冲突检测。
 
-| 来源             | 声明路径                                                          | 内容                                 |
-| ---------------- | ----------------------------------------------------------------- | ------------------------------------ |
-| 容器连接信息     | 各 `ContainerRegistration.Start()` 返回 `StartedContainer.SUTEnv` | MySQL DSN、Redis addr、Pulsar URL 等 |
-| SUT 进程静态配置 | `SUTBootPlan.GetCommand()` 设置 `cmd.Env`                         | `MSSIOT_ENV`、`MSSIOT_REGION` 等     |
+调用方在 `GetCommand()` 内：
+- 通过 Docker API 按容器名查询连接地址（如 `cli.ContainerInspect(ctx, "redis")`）
+- 将容器连接信息（如 `TEST_REDIS_ADDR`）和静态配置（如 `MSSIOT_ENV`）统一写入 `cmd.Env`
+- 使用 map 承接环境变量，天然不会出现键冲突
 
-合并顺序：先聚合各容器 `SUTEnv`（key 冲突触发全量回滚），再将容器 `SUTEnv` 逐 key 注入 `cmd.Env`（key 冲突报错拒绝启动），更新后的 `cmd.Env` 用于 `cmd.Start()`。
+**原因**：原有的"两段式声明 + 框架合并"设计引入了不必要的复杂度——框架需要在容器和 SUT 之间中转环境变量、做冲突检测，而调用方本身就能在 `GetCommand()` 中一站式解决所有 env 构造。简化后框架职责回归"容器生命周期管理 + SUT 进程管理"，不再承担"环境变量中介"角色。
 
-**原因**：这一分层设计保持了职责边界——`Registrar` 与容器有关，`GetCommand` 与 SUT 进程有关，两条路径互不越界；框架在统一合并点做冲突检测，语义清晰，错误信息可明确指向两类来源之一。
-
-**代码影响**：`sut_manager.ensureStarted` 在 `GetCommand` 之后新增合并步骤，替换原有 `if len(cmd.Env) == 0 { cmd.Env = os.Environ() }` 逻辑。
+**代码影响**：`StartSUTInput` 删除 `SUTEnv` 字段；`StartedContainer` 结构体删除（`Start` 直接返回 `testcontainers.Container`）；`ensureInfraStarted` 返回 `error`（不再返回 `map[string]string`）；`ensureSUTStarted` 不再接收 `env` 参数。
 
 ---
 
@@ -292,8 +269,6 @@ client 侧收到 LeaseID，测试代码从 os.Getenv() 读取 SUT 地址等信�
 | 风险                                                                    | 严重度 | 防护措施                                                                              |
 | ----------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------- |
 | 调用方 `Start` 实现质量参差，框架无法感知内部配置错误                   | 中     | 注册时校验 `Name`/`Start` 非空；`Start` 返回错误时单独报告注册名，触发全量回滚        |
-| 容器间 `SUTEnv` key 冲突                                                | 中     | 聚合时 fail-fast，错误信息包含冲突的两个注册名和 key，定位成本低                      |
-| `cmd.Env` 与 `SUTEnv` key 冲突                                          | 中     | 合并时 fail-fast，错误信息明确指出冲突的 key 及其来源（容器注册名 vs `cmd.Env`）      |
 | 删除 `SetEnvEndpoint` 后，测试代码（非 SUT 子进程）无法直接获取连接信息 | 低     | 该场景属于 Non-Goal；测试进程本身读不到 SUT 子进程的 env，这本就是隔离设计            |
 | 调用方不设置固定容器名，孤儿清理失效                                    | 低     | 文档约束 + 示例强制设名；Terminate 路径保证正常退出情况下不留孤儿                     |
 | `testcontainers-go` 版本之间行为差异由调用方自行承担                    | 低     | 这是权衡收益的一部分，框架不再需要跨版本维护 spec driver                              |

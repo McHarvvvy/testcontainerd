@@ -22,8 +22,6 @@ type StartSUTInput struct {
 	Project string
 	// RuntimePath 表示当前 daemon runtime 文件路径。
 	RuntimePath string
-	// SUTEnv 提供由容器侧聚合得到的环境变量集合。
-	SUTEnv map[string]string
 }
 
 // SUTBootPlan 定义被测服务启动与探测计划。
