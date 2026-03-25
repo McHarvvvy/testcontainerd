@@ -39,36 +39,40 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// handleDaemonMode 在 daemon 子进程中根据环境变量构建配置并启动 daemon。
-// 通过 TCD_SCENARIO 选择注册函数，TCD_IDLE_TTL 设置空闲超时，
-// TCD_SUT_TYPE / TCD_ENV_FILE / TCD_PROBE_ADDR 设置 SUT 计划。
+// handleDaemonMode 在 daemon 子进程中根据 TCD_SCENARIO 调用对应的配置函数并启动 daemon。
+// 每个场景配置函数与测试用例函数共用同一套配置，确保 client 与 daemon 使用完全相同的数据。
 func handleDaemonMode() int {
 	runtimePath := os.Getenv("TCD_RUNTIME")
-
-	idleTTL := 5 * time.Second
-	if v := os.Getenv("TCD_IDLE_TTL"); v != "" {
-		if parsed, err := time.ParseDuration(v); err == nil {
-			idleTTL = parsed
-		}
-	}
-
-	var sut tcd.SUTBootPlan
-	switch os.Getenv("TCD_SUT_TYPE") {
-	case "env-verify":
-		sut = sutEnvVerifySUT{envFile: os.Getenv("TCD_ENV_FILE")}
-	case "delayed-probe":
-		sut = delayedProbeSUT{probeAddr: os.Getenv("TCD_PROBE_ADDR")}
-	}
-
-	cfg := tcd.Config{
-		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
-		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: idleTTL},
-		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
-		SUT:    sut,
-	}
-
 	scenario := os.Getenv("TCD_SCENARIO")
-	inst, err := tcd.New(cfg, daemonRegisterFunc(scenario))
+
+	var cfg tcd.Config
+	var registerFn tcd.RegisterContainersFunc
+
+	switch scenario {
+	case "TestTC09SequentialRunReusesSameContainer":
+		cfg, registerFn = tc09Config(runtimePath)
+	case "TestTC10PartialStartFailureRollsBack":
+		cfg, registerFn = tc10Config(runtimePath)
+	case "TestTC11InitFailureRollsBackAll":
+		cfg, registerFn = tc11Config(runtimePath)
+	case "TestTC14SUTEnvInjectedIntoSUTProcess":
+		cfg, registerFn = tc14Config(runtimePath)
+	case "TestTC15SUTProbeReadyBeforeFakeMRun":
+		cfg, registerFn = tc15Config(runtimePath)
+	case "TestTC16DaemonIdleExitCleansUp":
+		cfg, registerFn = tc16Config(runtimePath)
+	case "TestTC17ConcurrentRunReusesSameContainer":
+		cfg, registerFn = tc17Config(runtimePath)
+	default:
+		cfg = tcd.Config{
+			Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+			Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 5 * time.Second},
+			Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+		}
+		registerFn = singleRedisRegisterFunc("redis")
+	}
+
+	inst, err := tcd.New(cfg, registerFn)
 	if err != nil {
 		log.Printf("daemon mode: tcd.New failed: %v", err)
 		return 1
@@ -76,32 +80,94 @@ func handleDaemonMode() int {
 	return inst.Run(&fakeRunnable{run: func() int { return 0 }})
 }
 
-// daemonRegisterFunc 根据场景名返回对应的容器注册函数。
-func daemonRegisterFunc(scenario string) tcd.RegisterContainersFunc {
-	switch scenario {
-	case "tc10":
-		return func(ctx context.Context) ([]container.ContainerRegistration, error) {
-			return []container.ContainerRegistration{
-				{Name: "redis-good", Start: startRealRedis("redis-good")},
-				{Name: "redis-bad", Start: startBadImage("redis-bad")},
-			}, nil
-		}
-	case "tc11":
-		return func(ctx context.Context) ([]container.ContainerRegistration, error) {
-			return []container.ContainerRegistration{
-				{Name: "redis-a", Start: startRealRedis("redis-a")},
-				{
-					Name:  "redis-b",
-					Start: startRealRedis("redis-b"),
-					Init: func(ctx context.Context) error {
-						return fmt.Errorf("init failed: seed data error")
-					},
-				},
-			}, nil
-		}
-	default:
-		return singleRedisRegisterFunc("redis")
+// ===========================================================================
+// 场景配置函数 — 测试函数与 TestMain switch case 调用同一函数，保证配置一致
+// ===========================================================================
+
+func tc09Config(runtimePath string) (tcd.Config, tcd.RegisterContainersFunc) {
+	return tcd.Config{
+		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 15 * time.Second},
+		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+	}, singleRedisRegisterFunc("redis")
+}
+
+func tc10Config(runtimePath string) (tcd.Config, tcd.RegisterContainersFunc) {
+	return tcd.Config{
+		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 5 * time.Second},
+		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+	}, func(ctx context.Context) ([]container.ContainerRegistration, error) {
+		return []container.ContainerRegistration{
+			{Name: "redis-good", Start: startRealRedis("redis-good")},
+			{Name: "redis-bad", Start: startBadImage("redis-bad")},
+		}, nil
 	}
+}
+
+func tc11Config(runtimePath string) (tcd.Config, tcd.RegisterContainersFunc) {
+	return tcd.Config{
+		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 5 * time.Second},
+		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+	}, func(ctx context.Context) ([]container.ContainerRegistration, error) {
+		return []container.ContainerRegistration{
+			{Name: "redis-a", Start: startRealRedis("redis-a")},
+			{
+				Name:  "redis-b",
+				Start: startRealRedis("redis-b"),
+				Init:  func(ctx context.Context) error { return fmt.Errorf("init failed: seed data error") },
+			},
+		}, nil
+	}
+}
+
+func tc14Config(runtimePath string) (tcd.Config, tcd.RegisterContainersFunc) {
+	// envFile 从 runtimePath 推导，test 与 daemon 调用同一函数得到相同路径。
+	// GetCommand 将 s.envFile 注入 SUT 进程，test 函数从 cfg.SUT 读取，无需额外 env var。
+	envFile := filepath.Join(filepath.Dir(runtimePath), "sut_env_output.txt")
+	return tcd.Config{
+		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 5 * time.Second},
+		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+		SUT:    sutEnvVerifySUT{envFile: envFile},
+	}, singleRedisRegisterFunc("redis")
+}
+
+// tc15ProbeAddr 根据 runtimePath 用 FNV-32a 哈希确定性推导探测端口（范围 20000–59999）。
+// t.TempDir() 保证每次测试的 runtimePath 唯一，因此端口唯一，无需 env var 传递。
+func tc15ProbeAddr(runtimePath string) string {
+	var h uint32 = 2166136261
+	for _, b := range []byte(runtimePath) {
+		h ^= uint32(b)
+		h *= 16777619
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(20000+h%40000)))
+}
+
+func tc15Config(runtimePath string) (tcd.Config, tcd.RegisterContainersFunc) {
+	return tcd.Config{
+		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 5 * time.Second},
+		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+		SUT:    delayedProbeSUT{probeAddr: tc15ProbeAddr(runtimePath)},
+	}, singleRedisRegisterFunc("redis")
+}
+
+func tc16Config(runtimePath string) (tcd.Config, tcd.RegisterContainersFunc) {
+	return tcd.Config{
+		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 1 * time.Second},
+		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+	}, singleRedisRegisterFunc("redis")
+}
+
+func tc17Config(runtimePath string) (tcd.Config, tcd.RegisterContainersFunc) {
+	return tcd.Config{
+		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: 15 * time.Second},
+		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+	}, singleRedisRegisterFunc("redis")
 }
 
 // ===========================================================================

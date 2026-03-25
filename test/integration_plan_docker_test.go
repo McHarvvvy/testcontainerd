@@ -4,7 +4,6 @@ package test
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	tcd "github.com/McHarvvvy/testcontainerd"
-	"github.com/McHarvvvy/testcontainerd/container"
 	"github.com/McHarvvvy/testcontainerd/tcdruntime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -89,11 +87,9 @@ func TestTC08SuccessfulRunAndExitCodePassthrough(t *testing.T) {
 
 func TestTC09SequentialRunReusesSameContainer(t *testing.T) {
 	requireDocker(t)
-	t.Setenv("TCD_IDLE_TTL", "15s")
-	cfg := dockerTestConfig(t)
-	cfg.Daemon.IdleTTL = 15 * time.Second
-	registerFn := singleRedisRegisterFunc("redis")
-	runtimePath := cfg.Global.RuntimePath
+	t.Setenv("TCD_SCENARIO", "TestTC09SequentialRunReusesSameContainer")
+	runtimePath := filepath.Join(t.TempDir(), "runtime.json")
+	cfg, registerFn := tc09Config(runtimePath)
 	t.Cleanup(func() { cleanupEnv("redis", runtimePath) })
 
 	var id1, id2 string
@@ -144,15 +140,10 @@ func TestTC09SequentialRunReusesSameContainer(t *testing.T) {
 
 func TestTC10PartialStartFailureRollsBack(t *testing.T) {
 	requireDocker(t)
-	t.Setenv("TCD_SCENARIO", "tc10")
-	cfg := dockerTestConfig(t)
-	registerFn := func(ctx context.Context) ([]container.ContainerRegistration, error) {
-		return []container.ContainerRegistration{
-			{Name: "redis-good", Start: startRealRedis("redis-good")},
-			{Name: "redis-bad", Start: startBadImage("redis-bad")},
-		}, nil
-	}
-	t.Cleanup(func() { cleanupEnv("redis-good", cfg.Global.RuntimePath) })
+	t.Setenv("TCD_SCENARIO", "TestTC10PartialStartFailureRollsBack")
+	runtimePath := filepath.Join(t.TempDir(), "runtime.json")
+	cfg, registerFn := tc10Config(runtimePath)
+	t.Cleanup(func() { cleanupEnv("redis-good", runtimePath) })
 
 	inst, err := tcd.New(cfg, registerFn)
 	require.NoError(t, err)
@@ -194,22 +185,11 @@ func TestTC10PartialStartFailureRollsBack(t *testing.T) {
 
 func TestTC11InitFailureRollsBackAll(t *testing.T) {
 	requireDocker(t)
-	t.Setenv("TCD_SCENARIO", "tc11")
-	cfg := dockerTestConfig(t)
-	registerFn := func(ctx context.Context) ([]container.ContainerRegistration, error) {
-		return []container.ContainerRegistration{
-			{Name: "redis-a", Start: startRealRedis("redis-a")},
-			{
-				Name:  "redis-b",
-				Start: startRealRedis("redis-b"),
-				Init: func(ctx context.Context) error {
-					return fmt.Errorf("init failed: seed data error")
-				},
-			},
-		}, nil
-	}
+	t.Setenv("TCD_SCENARIO", "TestTC11InitFailureRollsBackAll")
+	runtimePath := filepath.Join(t.TempDir(), "runtime.json")
+	cfg, registerFn := tc11Config(runtimePath)
 	t.Cleanup(func() {
-		cleanupEnv("redis-a", cfg.Global.RuntimePath)
+		cleanupEnv("redis-a", runtimePath)
 		_ = cleanupContainerByName(context.Background(), "redis-b")
 	})
 
@@ -254,14 +234,11 @@ func TestTC11InitFailureRollsBackAll(t *testing.T) {
 
 func TestTC14SUTEnvInjectedIntoSUTProcess(t *testing.T) {
 	requireDocker(t)
-	envFile := filepath.Join(t.TempDir(), "sut_env_output.txt")
-	t.Setenv("TCD_SUT_TYPE", "env-verify")
-	t.Setenv("TCD_ENV_FILE", envFile)
-	t.Cleanup(func() { _ = os.Remove(envFile) })
-	cfg := dockerTestConfig(t)
-	cfg.SUT = sutEnvVerifySUT{envFile: envFile}
-	registerFn := singleRedisRegisterFunc("redis")
-	t.Cleanup(func() { cleanupEnv("redis", cfg.Global.RuntimePath) })
+	t.Setenv("TCD_SCENARIO", "TestTC14SUTEnvInjectedIntoSUTProcess")
+	runtimePath := filepath.Join(t.TempDir(), "runtime.json")
+	cfg, registerFn := tc14Config(runtimePath)
+	envFile := cfg.SUT.(sutEnvVerifySUT).envFile
+	t.Cleanup(func() { cleanupEnv("redis", runtimePath) })
 
 	inst, err := tcd.New(cfg, registerFn)
 	require.NoError(t, err)
@@ -304,15 +281,11 @@ func TestTC14SUTEnvInjectedIntoSUTProcess(t *testing.T) {
 
 func TestTC15SUTProbeReadyBeforeFakeMRun(t *testing.T) {
 	requireDocker(t)
-	probeAddr, err := reserveTCPAddr()
-	require.NoError(t, err)
-	t.Setenv("TCD_SUT_TYPE", "delayed-probe")
-	t.Setenv("TCD_PROBE_ADDR", probeAddr)
-
-	cfg := dockerTestConfig(t)
-	cfg.SUT = delayedProbeSUT{probeAddr: probeAddr}
-	registerFn := singleRedisRegisterFunc("redis")
-	t.Cleanup(func() { cleanupEnv("redis", cfg.Global.RuntimePath) })
+	t.Setenv("TCD_SCENARIO", "TestTC15SUTProbeReadyBeforeFakeMRun")
+	runtimePath := filepath.Join(t.TempDir(), "runtime.json")
+	cfg, registerFn := tc15Config(runtimePath)
+	probeAddr := cfg.SUT.(delayedProbeSUT).probeAddr
+	t.Cleanup(func() { cleanupEnv("redis", runtimePath) })
 
 	inst, err := tcd.New(cfg, registerFn)
 	require.NoError(t, err)
@@ -349,11 +322,9 @@ func TestTC15SUTProbeReadyBeforeFakeMRun(t *testing.T) {
 
 func TestTC16DaemonIdleExitCleansUp(t *testing.T) {
 	requireDocker(t)
-	t.Setenv("TCD_IDLE_TTL", "1s")
-	cfg := dockerTestConfig(t)
-	cfg.Daemon.IdleTTL = 1 * time.Second
-	registerFn := singleRedisRegisterFunc("redis")
-	runtimePath := cfg.Global.RuntimePath
+	t.Setenv("TCD_SCENARIO", "TestTC16DaemonIdleExitCleansUp")
+	runtimePath := filepath.Join(t.TempDir(), "runtime.json")
+	cfg, registerFn := tc16Config(runtimePath)
 	t.Cleanup(func() { cleanupEnv("redis", runtimePath) })
 
 	inst, err := tcd.New(cfg, registerFn)
@@ -402,11 +373,10 @@ func TestTC16DaemonIdleExitCleansUp(t *testing.T) {
 
 func TestTC17ConcurrentRunReusesSameContainer(t *testing.T) {
 	requireDocker(t)
-	t.Setenv("TCD_IDLE_TTL", "15s")
-	cfg := dockerTestConfig(t)
-	cfg.Daemon.IdleTTL = 15 * time.Second
-	registerFn := singleRedisRegisterFunc("redis")
-	t.Cleanup(func() { cleanupEnv("redis", cfg.Global.RuntimePath) })
+	t.Setenv("TCD_SCENARIO", "TestTC17ConcurrentRunReusesSameContainer")
+	runtimePath := filepath.Join(t.TempDir(), "runtime.json")
+	cfg, registerFn := tc17Config(runtimePath)
+	t.Cleanup(func() { cleanupEnv("redis", runtimePath) })
 
 	containerIDs := make(chan string, 3)
 	var wg sync.WaitGroup
