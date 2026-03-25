@@ -12,7 +12,7 @@ func (d *Daemon) ensureInfraStarted(ctx context.Context) error {
 	if d.infraStarted {
 		return nil
 	}
-	_, err := d.bundle.StartAll(ctx)
+	err := d.bundle.StartAll(ctx)
 	if err != nil {
 		log.Printf("testcontainerd ensureInfraStarted failed: %v", err)
 		return err

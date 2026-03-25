@@ -89,6 +89,7 @@ func TestTC08SuccessfulRunAndExitCodePassthrough(t *testing.T) {
 
 func TestTC09SequentialRunReusesSameContainer(t *testing.T) {
 	requireDocker(t)
+	t.Setenv("TCD_IDLE_TTL", "15s")
 	cfg := dockerTestConfig(t)
 	cfg.Daemon.IdleTTL = 15 * time.Second
 	registerFn := singleRedisRegisterFunc("redis")
@@ -143,6 +144,7 @@ func TestTC09SequentialRunReusesSameContainer(t *testing.T) {
 
 func TestTC10PartialStartFailureRollsBack(t *testing.T) {
 	requireDocker(t)
+	t.Setenv("TCD_SCENARIO", "tc10")
 	cfg := dockerTestConfig(t)
 	registerFn := func(ctx context.Context) ([]container.ContainerRegistration, error) {
 		return []container.ContainerRegistration{
@@ -192,6 +194,7 @@ func TestTC10PartialStartFailureRollsBack(t *testing.T) {
 
 func TestTC11InitFailureRollsBackAll(t *testing.T) {
 	requireDocker(t)
+	t.Setenv("TCD_SCENARIO", "tc11")
 	cfg := dockerTestConfig(t)
 	registerFn := func(ctx context.Context) ([]container.ContainerRegistration, error) {
 		return []container.ContainerRegistration{
@@ -252,6 +255,8 @@ func TestTC11InitFailureRollsBackAll(t *testing.T) {
 func TestTC14SUTEnvInjectedIntoSUTProcess(t *testing.T) {
 	requireDocker(t)
 	envFile := filepath.Join(t.TempDir(), "sut_env_output.txt")
+	t.Setenv("TCD_SUT_TYPE", "env-verify")
+	t.Setenv("TCD_ENV_FILE", envFile)
 	t.Cleanup(func() { _ = os.Remove(envFile) })
 	cfg := dockerTestConfig(t)
 	cfg.SUT = sutEnvVerifySUT{envFile: envFile}
@@ -301,6 +306,8 @@ func TestTC15SUTProbeReadyBeforeFakeMRun(t *testing.T) {
 	requireDocker(t)
 	probeAddr, err := reserveTCPAddr()
 	require.NoError(t, err)
+	t.Setenv("TCD_SUT_TYPE", "delayed-probe")
+	t.Setenv("TCD_PROBE_ADDR", probeAddr)
 
 	cfg := dockerTestConfig(t)
 	cfg.SUT = delayedProbeSUT{probeAddr: probeAddr}
@@ -342,6 +349,7 @@ func TestTC15SUTProbeReadyBeforeFakeMRun(t *testing.T) {
 
 func TestTC16DaemonIdleExitCleansUp(t *testing.T) {
 	requireDocker(t)
+	t.Setenv("TCD_IDLE_TTL", "1s")
 	cfg := dockerTestConfig(t)
 	cfg.Daemon.IdleTTL = 1 * time.Second
 	registerFn := singleRedisRegisterFunc("redis")
@@ -394,6 +402,7 @@ func TestTC16DaemonIdleExitCleansUp(t *testing.T) {
 
 func TestTC17ConcurrentRunReusesSameContainer(t *testing.T) {
 	requireDocker(t)
+	t.Setenv("TCD_IDLE_TTL", "15s")
 	cfg := dockerTestConfig(t)
 	cfg.Daemon.IdleTTL = 15 * time.Second
 	registerFn := singleRedisRegisterFunc("redis")

@@ -39,6 +39,7 @@ type Config struct {
 // Daemon 负责管理 testcontainer 生命周期。
 type Daemon struct {
 	cfg         Config
+	regs        []container.ContainerRegistration
 	bundle      *container.Bundle
 	store       *leaseStore
 	httpServer  *http.Server
@@ -58,7 +59,7 @@ type Daemon struct {
 }
 
 // New 创建守护进程实例。
-func New(cfg Config, registry *container.Registry) *Daemon {
+func New(cfg Config, regs []container.ContainerRegistration) (*Daemon, error) {
 	if cfg.Addr == "" {
 		// 关键决策：默认使用随机可用端口，避免本地并发测试或残留进程导致固定端口冲突。
 		cfg.Addr = "127.0.0.1:0"
@@ -75,19 +76,20 @@ func New(cfg Config, registry *container.Registry) *Daemon {
 	if strings.TrimSpace(cfg.Project) == "" {
 		cfg.Project = "default"
 	}
-	if registry == nil {
-		registry = container.NewRegistry()
+	bundle, err := container.NewBundle(regs)
+	if err != nil {
+		return nil, err
 	}
-	registry.Freeze()
 	return &Daemon{
 		cfg:         cfg,
-		bundle:      container.NewBundle(registry),
+		regs:        regs,
+		bundle:      bundle,
 		store:       newLeaseStore(),
 		startedAt:   time.Now(),
 		runtimePath: cfg.RuntimePath,
 		sut:         newSUTManager(cfg.SUT),
 		done:        make(chan struct{}),
-	}
+	}, nil
 }
 
 // Start 启动守护进程并阻塞直到退出。
@@ -99,7 +101,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	defer logFile.Close()
 	log.SetOutput(logFile)
 
-	if err := CleanupOrphans(ctx, d.bundle.RegisteredContainers()); err != nil {
+	if err := CleanupOrphans(ctx, d.regs); err != nil {
 		return err
 	}
 

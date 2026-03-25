@@ -6,9 +6,11 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -19,11 +21,88 @@ import (
 
 	tcd "github.com/McHarvvvy/testcontainerd"
 	"github.com/McHarvvvy/testcontainerd/container"
+	"github.com/McHarvvvy/testcontainerd/tcdruntime"
 	dockercontainer "github.com/docker/docker/api/types/container"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
+
+// ===========================================================================
+// TestMain — 测试入口，处理 daemon 子进程 re-exec
+// ===========================================================================
+
+func TestMain(m *testing.M) {
+	if os.Getenv("TCD_MODE") == "daemon" {
+		os.Exit(handleDaemonMode())
+	}
+	os.Exit(m.Run())
+}
+
+// handleDaemonMode 在 daemon 子进程中根据环境变量构建配置并启动 daemon。
+// 通过 TCD_SCENARIO 选择注册函数，TCD_IDLE_TTL 设置空闲超时，
+// TCD_SUT_TYPE / TCD_ENV_FILE / TCD_PROBE_ADDR 设置 SUT 计划。
+func handleDaemonMode() int {
+	runtimePath := os.Getenv("TCD_RUNTIME")
+
+	idleTTL := 5 * time.Second
+	if v := os.Getenv("TCD_IDLE_TTL"); v != "" {
+		if parsed, err := time.ParseDuration(v); err == nil {
+			idleTTL = parsed
+		}
+	}
+
+	var sut tcd.SUTBootPlan
+	switch os.Getenv("TCD_SUT_TYPE") {
+	case "env-verify":
+		sut = sutEnvVerifySUT{envFile: os.Getenv("TCD_ENV_FILE")}
+	case "delayed-probe":
+		sut = delayedProbeSUT{probeAddr: os.Getenv("TCD_PROBE_ADDR")}
+	}
+
+	cfg := tcd.Config{
+		Global: tcd.GlobalConfig{RuntimePath: runtimePath},
+		Daemon: tcd.DaemonConfig{Addr: "127.0.0.1:0", IdleTTL: idleTTL},
+		Client: tcd.ClientConfig{HTTPTimeout: 15 * time.Second},
+		SUT:    sut,
+	}
+
+	scenario := os.Getenv("TCD_SCENARIO")
+	inst, err := tcd.New(cfg, daemonRegisterFunc(scenario))
+	if err != nil {
+		log.Printf("daemon mode: tcd.New failed: %v", err)
+		return 1
+	}
+	return inst.Run(&fakeRunnable{run: func() int { return 0 }})
+}
+
+// daemonRegisterFunc 根据场景名返回对应的容器注册函数。
+func daemonRegisterFunc(scenario string) tcd.RegisterContainersFunc {
+	switch scenario {
+	case "tc10":
+		return func(ctx context.Context) ([]container.ContainerRegistration, error) {
+			return []container.ContainerRegistration{
+				{Name: "redis-good", Start: startRealRedis("redis-good")},
+				{Name: "redis-bad", Start: startBadImage("redis-bad")},
+			}, nil
+		}
+	case "tc11":
+		return func(ctx context.Context) ([]container.ContainerRegistration, error) {
+			return []container.ContainerRegistration{
+				{Name: "redis-a", Start: startRealRedis("redis-a")},
+				{
+					Name:  "redis-b",
+					Start: startRealRedis("redis-b"),
+					Init: func(ctx context.Context) error {
+						return fmt.Errorf("init failed: seed data error")
+					},
+				},
+			}, nil
+		}
+	default:
+		return singleRedisRegisterFunc("redis")
+	}
+}
 
 // ===========================================================================
 // fakeRunnable — 测试用 Runnable 实现
@@ -51,7 +130,7 @@ func (d delayedProbeSUT) GetGracePeriod() time.Duration  { return 2 * time.Secon
 func (d delayedProbeSUT) GetProbeAddrs() []string        { return []string{d.probeAddr} }
 func (d delayedProbeSUT) GetCommand(_ context.Context, _ tcd.StartSUTInput) (*exec.Cmd, error) {
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperDelayedProbeSUT")
-	cmd.Env = append(os.Environ(), "TCD_HELPER_PROCESS=1", "TCD_HELPER_PROBE_ADDR="+d.probeAddr)
+	cmd.Env = append(os.Environ(), "TCD_MODE=", "TCD_HELPER_PROCESS=1", "TCD_HELPER_PROBE_ADDR="+d.probeAddr)
 	cmd.Dir = os.TempDir()
 	return cmd, nil
 }
@@ -77,6 +156,7 @@ func (s sutEnvVerifySUT) GetCommand(ctx context.Context, _ tcd.StartSUTInput) (*
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=TestHelperSUTEnvVerify")
 	cmd.Env = append(os.Environ(),
+		"TCD_MODE=", // 清除 daemon 模式标记，让 helper 进程正常执行测试函数
 		"TCD_HELPER_PROCESS=1",
 		"TCD_HELPER_ENV_FILE="+s.envFile,
 		"TEST_REDIS_ADDR="+redisAddr,
@@ -128,14 +208,14 @@ func TestHelperSUTEnvVerify(t *testing.T) {
 	redisAddr := os.Getenv("TEST_REDIS_ADDR")
 	if redisAddr == "" {
 		_ = os.WriteFile(envFile, []byte("fail"), 0o644)
-		select {} // 阻塞保活
+		blockForever() // 阻塞保活
 	}
 	if err := getRedis(redisAddr); err != nil {
 		_ = os.WriteFile(envFile, []byte("fail"), 0o644)
 	} else {
 		_ = os.WriteFile(envFile, []byte("success"), 0o644)
 	}
-	select {} // 阻塞保活，框架在测试结束后终止此进程
+	blockForever() // 阻塞保活，框架在测试结束后终止此进程
 }
 
 // ===========================================================================
@@ -281,8 +361,36 @@ func cleanupContainerByName(ctx context.Context, name string) error {
 
 func cleanupEnv(containerName, runtimePath string) {
 	ctx := context.Background()
+	// 先终止 daemon 进程，释放 Windows 上的文件锁（daemon.log 等），
+	// 否则 t.TempDir 清理时会因文件被占用而失败。
+	if info, err := tcdruntime.Read(runtimePath); err == nil && info.PID > 0 {
+		killProcess(info.PID)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if !processAlive(info.PID) {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
 	_ = cleanupContainerByName(ctx, containerName)
 	_ = os.Remove(runtimePath)
+	// 清理 runner 目录中的 daemon 副本可执行文件（Windows 特有）
+	runnerDir := tcdruntime.RunnerDir(runtimePath)
+	_ = os.RemoveAll(runnerDir)
+}
+
+func killProcess(pid int) {
+	if pid <= 0 {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+		return
+	}
+	if p, err := os.FindProcess(pid); err == nil {
+		_ = p.Signal(syscall.SIGTERM)
+	}
 }
 
 // ===========================================================================
@@ -365,6 +473,14 @@ func probeTCP(addr string, timeout time.Duration) error {
 // ===========================================================================
 // 辅助函数：进程检查
 // ===========================================================================
+
+// blockForever 阻塞当前 goroutine 直到收到终止信号。
+// 不使用 select {} 是因为 Go 运行时的死锁检测器会在所有 goroutine 都处于休眠时触发 panic。
+func blockForever() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+}
 
 func processAlive(pid int) bool {
 	if pid <= 0 {

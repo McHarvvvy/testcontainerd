@@ -4,9 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
-
-	"github.com/McHarvvvy/testcontainerd/protocol"
 
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -14,102 +13,87 @@ import (
 const maxCreateConcurrency = 4
 
 type startResult struct {
-	name     string
-	resource RuntimeResource
-	ctr      testcontainers.Container
-	err      error
+	name string
+	ctr  testcontainers.Container
+	err  error
 }
 
 // Bundle 负责测试容器资源生命周期。
 type Bundle struct {
-	mu          sync.Mutex
-	started     bool
-	registry    *Registry
-	instances   []InstanceConfig
-	runtime     map[string]RuntimeResource
+	mu      sync.Mutex
+	started bool
+	regs    []ContainerRegistration
+
 	startOrder  []string
 	cleanup     []testcontainers.Container
 	containerBy map[string]testcontainers.Container
 }
 
-// NewBundle 创建容器资源管理对象。
-func NewBundle(registry *Registry) *Bundle {
-	if registry == nil {
-		registry = NewRegistry()
+// NewBundle 创建容器资源管理对象，校验注册项合法性。
+func NewBundle(regs []ContainerRegistration) (*Bundle, error) {
+	if len(regs) == 0 {
+		return nil, fmt.Errorf("container registrations cannot be empty")
+	}
+	seen := make(map[string]struct{}, len(regs))
+	for _, reg := range regs {
+		name := strings.TrimSpace(reg.Name)
+		if name == "" {
+			return nil, fmt.Errorf("container registration name cannot be empty")
+		}
+		if reg.Start == nil {
+			return nil, fmt.Errorf("container registration start cannot be nil: %s", name)
+		}
+		if _, ok := seen[name]; ok {
+			return nil, fmt.Errorf("duplicated container name: %s", name)
+		}
+		seen[name] = struct{}{}
 	}
 	return &Bundle{
-		registry:    registry,
-		instances:   nil,
-		runtime:     map[string]RuntimeResource{},
-		startOrder:  make([]string, 0, 8),
-		cleanup:     make([]testcontainers.Container, 0, 8),
-		containerBy: map[string]testcontainers.Container{},
-	}
+		regs:        regs,
+		startOrder:  make([]string, 0, len(regs)),
+		cleanup:     make([]testcontainers.Container, 0, len(regs)),
+		containerBy: make(map[string]testcontainers.Container, len(regs)),
+	}, nil
 }
 
-// RegisteredContainers 返回当前注册的容器配置快照。
-func (b *Bundle) RegisteredContainers() []InstanceConfig {
-	return b.registry.Snapshot()
-}
-
-// StartAll 启动全部依赖容器并返回连接信息。
-func (b *Bundle) StartAll(ctx context.Context) (map[string]protocol.ResourceEndpoint, error) {
+// StartAll 启动全部依赖容器。
+func (b *Bundle) StartAll(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.started {
-		return b.resourcesLocked(), nil
-	}
-	if len(b.instances) == 0 {
-		b.instances = b.registry.Snapshot()
-	}
-	if len(b.instances) == 0 {
-		return nil, fmt.Errorf("no container instances registered")
+		return nil
 	}
 
-	ordered := b.instances
-
-	runtimeByName, containerByName, startErr := b.startAllContainers(ctx, ordered)
+	containerByName, startErr := b.startAllContainers(ctx, b.regs)
 	if startErr != nil {
-		return nil, startErr
+		return startErr
 	}
-	for _, cfg := range ordered {
-		resource, ok := runtimeByName[cfg.Name]
+	for _, reg := range b.regs {
+		ctr, ok := containerByName[reg.Name]
 		if !ok {
-			_ = terminateCreatedContainers(ctx, ordered, containerByName)
-			return nil, fmt.Errorf("runtime resource not found after start: %s", cfg.Name)
+			_ = terminateCreatedContainers(ctx, b.regs, containerByName)
+			return fmt.Errorf("container not found after start: %s", reg.Name)
 		}
-		ctr, ok := containerByName[cfg.Name]
-		if !ok {
-			_ = terminateCreatedContainers(ctx, ordered, containerByName)
-			return nil, fmt.Errorf("container instance not found after start: %s", cfg.Name)
-		}
-		b.runtime[cfg.Name] = resource
-		b.startOrder = append(b.startOrder, cfg.Name)
+		b.startOrder = append(b.startOrder, reg.Name)
 		b.cleanup = append(b.cleanup, ctr)
-		b.containerBy[cfg.Name] = ctr
+		b.containerBy[reg.Name] = ctr
 	}
 
-	view := newRuntimeView(b.runtime)
-	// 关键决策：容器全部启动后再执行 Init，确保初始化逻辑可访问完整运行时视图。
-	for _, cfg := range ordered {
-		if cfg.Init == nil {
+	// 关键决策：容器全部启动后再执行 Init，确保初始化逻辑可访问所有已启动容器。
+	for _, reg := range b.regs {
+		if reg.Init == nil {
 			continue
 		}
-		self, ok := b.runtime[cfg.Name]
-		if !ok {
-			_ = b.rollback(ctx)
-			return nil, fmt.Errorf("runtime resource not found for init: %s", cfg.Name)
-		}
-		if err := cfg.Init(ctx, InitInput{Self: self, Runtime: view}); err != nil {
+		if err := reg.Init(ctx); err != nil {
 			// 关键决策：初始化失败同样回滚，保证下次 Acquire 仍从干净环境开始。
 			_ = b.rollback(ctx)
-			return nil, fmt.Errorf("run init for %s failed: %w", cfg.Name, err)
+			return fmt.Errorf("run init for %s failed: %w", reg.Name, err)
 		}
 	}
 
 	b.started = true
-	return b.resourcesLocked(), nil
+	return nil
 }
 
 // StopAll 销毁全部依赖容器。
@@ -130,21 +114,12 @@ func (b *Bundle) Started() bool {
 	return b.started
 }
 
-// Endpoints 返回当前连接信息快照。
-func (b *Bundle) Endpoints() map[string]protocol.ResourceEndpoint {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.resourcesLocked()
-}
-
-// Containers 返回当前容器实例列表。
+// Containers 返回当前已启动的容器注册名列表。
 func (b *Bundle) Containers() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	result := make([]string, 0, len(b.runtime))
-	for name, res := range b.runtime {
-		result = append(result, fmt.Sprintf("%s/%s", res.Type, name))
-	}
+	result := make([]string, len(b.startOrder))
+	copy(result, b.startOrder)
 	sort.Strings(result)
 	return result
 }
@@ -155,26 +130,25 @@ func (b *Bundle) rollback(ctx context.Context) error {
 	return err
 }
 
-func (b *Bundle) startAllContainers(ctx context.Context, ordered []InstanceConfig) (map[string]RuntimeResource, map[string]testcontainers.Container, error) {
-	runtimeByName := make(map[string]RuntimeResource, len(ordered))
-	containerByName := make(map[string]testcontainers.Container, len(ordered))
-	if len(ordered) == 0 {
-		return runtimeByName, containerByName, nil
+func (b *Bundle) startAllContainers(ctx context.Context, regs []ContainerRegistration) (map[string]testcontainers.Container, error) {
+	containerByName := make(map[string]testcontainers.Container, len(regs))
+	if len(regs) == 0 {
+		return containerByName, nil
 	}
 
 	createCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobs := make(chan InstanceConfig, len(ordered))
-	for _, cfg := range ordered {
-		jobs <- cfg
+	jobs := make(chan ContainerRegistration, len(regs))
+	for _, reg := range regs {
+		jobs <- reg
 	}
 	close(jobs)
 
-	results := make(chan startResult, len(ordered))
+	results := make(chan startResult, len(regs))
 	workerN := maxCreateConcurrency
-	if len(ordered) < workerN {
-		workerN = len(ordered)
+	if len(regs) < workerN {
+		workerN = len(regs)
 	}
 
 	var wg sync.WaitGroup
@@ -182,17 +156,17 @@ func (b *Bundle) startAllContainers(ctx context.Context, ordered []InstanceConfi
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for cfg := range jobs {
+			for reg := range jobs {
 				if createCtx.Err() != nil {
 					continue
 				}
-				resource, ctr, err := b.startContainer(createCtx, cfg)
+				ctr, err := reg.Start(createCtx)
 				if err != nil {
-					results <- startResult{name: cfg.Name, err: fmt.Errorf("start container %s failed: %w", cfg.Name, err)}
+					results <- startResult{name: reg.Name, err: fmt.Errorf("start container %s failed: %w", reg.Name, err)}
 					cancel()
 					continue
 				}
-				results <- startResult{name: cfg.Name, resource: resource, ctr: ctr}
+				results <- startResult{name: reg.Name, ctr: ctr}
 			}
 		}()
 	}
@@ -210,23 +184,23 @@ func (b *Bundle) startAllContainers(ctx context.Context, ordered []InstanceConfi
 			}
 			continue
 		}
-		runtimeByName[result.name] = result.resource
 		containerByName[result.name] = result.ctr
 	}
 
 	if firstErr != nil {
-		if terminateErr := terminateCreatedContainers(ctx, ordered, containerByName); terminateErr != nil {
-			return nil, nil, fmt.Errorf("%w; rollback failed: %v", firstErr, terminateErr)
+		if terminateErr := terminateCreatedContainers(ctx, regs, containerByName); terminateErr != nil {
+			return nil, fmt.Errorf("%w; rollback failed: %v", firstErr, terminateErr)
 		}
-		return nil, nil, firstErr
+		return nil, firstErr
 	}
-	return runtimeByName, containerByName, nil
+	return containerByName, nil
 }
 
-func terminateCreatedContainers(ctx context.Context, ordered []InstanceConfig, containers map[string]testcontainers.Container) error {
+func terminateCreatedContainers(ctx context.Context, regs []ContainerRegistration, containers map[string]testcontainers.Container) error {
 	var firstErr error
-	for i := len(ordered) - 1; i >= 0; i-- {
-		ctr, ok := containers[ordered[i].Name]
+	// 关键决策：按逆序停止，尽量贴近依赖拓扑。
+	for i := len(regs) - 1; i >= 0; i-- {
+		ctr, ok := containers[regs[i].Name]
 		if !ok || ctr == nil {
 			continue
 		}
@@ -254,32 +228,7 @@ func (b *Bundle) stopAllContainers(ctx context.Context) error {
 
 func (b *Bundle) resetState() {
 	b.started = false
-	b.runtime = map[string]RuntimeResource{}
-	b.startOrder = make([]string, 0, len(b.instances))
-	b.cleanup = make([]testcontainers.Container, 0, len(b.instances))
-	b.containerBy = map[string]testcontainers.Container{}
-}
-
-func (b *Bundle) resourcesLocked() map[string]protocol.ResourceEndpoint {
-	result := make(map[string]protocol.ResourceEndpoint, len(b.runtime))
-	for name, r := range b.runtime {
-		ports := make(map[string]int, len(r.Ports))
-		for k, v := range r.Ports {
-			ports[k] = v
-		}
-		meta := make(map[string]string, len(r.Metadata))
-		for k, v := range r.Metadata {
-			meta[k] = v
-		}
-		result[name] = protocol.ResourceEndpoint{
-			Name:     r.Name,
-			Type:     string(r.Type),
-			Image:    r.Image,
-			Host:     r.Host,
-			Ports:    ports,
-			URI:      r.URI,
-			Metadata: meta,
-		}
-	}
-	return result
+	b.startOrder = make([]string, 0, len(b.regs))
+	b.cleanup = make([]testcontainers.Container, 0, len(b.regs))
+	b.containerBy = make(map[string]testcontainers.Container, len(b.regs))
 }

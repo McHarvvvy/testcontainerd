@@ -9,18 +9,6 @@ type AcquireReq struct {
 	RunID   string `json:"run_id,omitempty"`
 }
 
-// ResourceEndpoint 表示单个容器实例的连接信息。
-// 兼容旧实现保留该类型，但 AcquireResp 不再返回此字段。
-type ResourceEndpoint struct {
-	Name     string            `json:"name"`
-	Type     string            `json:"type"`
-	Image    string            `json:"image"`
-	Host     string            `json:"host"`
-	Ports    map[string]int    `json:"ports"`
-	URI      string            `json:"uri"`
-	Metadata map[string]string `json:"metadata,omitempty"`
-}
-
 // AcquireResp 表示租约申请响应。
 type AcquireResp struct {
 	LeaseID    string    `json:"lease_id"`

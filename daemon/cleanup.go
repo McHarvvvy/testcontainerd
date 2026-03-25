@@ -14,18 +14,18 @@ import (
 )
 
 // CleanupOrphans 在守护进程启动前清理同名遗留容器。
-func CleanupOrphans(ctx context.Context, snapshot []tdcontainer.InstanceConfig) error {
+func CleanupOrphans(ctx context.Context, regs []tdcontainer.ContainerRegistration) error {
 	// 关键决策：容器名称已与配置名绑定，daemon 冷启动前必须清理同名残留容器，
 	// 否则 Docker 会因为 name conflict 拒绝创建新容器，影响整套测试拉起。
-	if len(snapshot) == 0 {
+	if len(regs) == 0 {
 		return nil
 	}
-	targets := make(map[string]struct{}, len(snapshot))
-	for _, cfg := range snapshot {
-		if cfg.Name == "" {
+	targets := make(map[string]struct{}, len(regs))
+	for _, reg := range regs {
+		if reg.Name == "" {
 			continue
 		}
-		targets[cfg.Name] = struct{}{}
+		targets[reg.Name] = struct{}{}
 	}
 	if len(targets) == 0 {
 		return nil

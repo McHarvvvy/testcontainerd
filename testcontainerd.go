@@ -173,15 +173,12 @@ func (t *TestContainerd) runDaemonMode() int {
 		dcfg.RuntimePath = v
 	}
 
-	registry := container.NewRegistry()
-	for _, reg := range t.registrations {
-		if err := registry.Register(container.InstanceConfig{Name: reg.Name, Type: container.TypeRedis, Image: "redis:7.2-alpine"}); err != nil {
-			log.Printf("testcontainerd register compatibility bridge failed: %v", err)
-			return 1
-		}
+	d, err := daemon.New(dcfg, t.registrations)
+	if err != nil {
+		log.Printf("testcontainerd daemon.New failed: %v", err)
+		return 1
 	}
-	d := daemon.New(dcfg, registry)
-	if err := d.Start(ctx); err != nil {
+	if err = d.Start(ctx); err != nil {
 		log.Printf("testcontainerd daemon mode exited with error: %v", err)
 		return 1
 	}
